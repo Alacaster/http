@@ -202,7 +202,19 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
 
 void processheader(struct client_list_t* client){
     char * lengthtype_s;
-    if(lengthtype_s = strstr(requests->body_start, "Content-Length:"));
+    if(lengthtype_s = strstr(requests->body_start, "Content-Length:")){
+        requests[clientindex].http_header.content_length_s = lengthtype_s;
+        lengthtype_s+=strlen("Content-Length:");
+        char * a = lengthtype_s;
+        while(isspace(a) || *a != '\r') a++;
+        if(isdigit(a)) lengthtype_s = a;
+        while(*a != '\r') a++;
+        *a = '\0';
+        requests[clientindex].http_header.content_length = atoi(lengthtype_s);
+        requests[clientindex].handlerindex = FN_GETBODYCONTENTLENGTH;
+    }else if(lengthtype_s = strstr(requests->body_start, "Transfer-Encoding: chunked")){
+        requests[clientindex].handlerindex = FN_GETBODYCHUNKED;
+    }else {requests[clientindex].handlerindex = FN_GETBODYCONNECTION;}
 }
 
 void getheader(struct client_list_t* client, int newbytes){//find when the header is complete
@@ -212,11 +224,10 @@ void getheader(struct client_list_t* client, int newbytes){//find when the heade
     }
     char * startscan = requests[clientindex].request_end - newbytes - 3;
     if(startscan-requests[clientindex].request < 0) startscan = requests[clientindex].request;
-    char * bodystart = strstr(requests[clientindex].request, "\r\n\r\n");
-    if(bodystart){
-        requests[clientindex].body_start = bodystart+4;
-        processheader(client);
-    }
+    char * bodystart = strstr(startscan, "\r\n\r\n");
+    if(!bodystart) return;
+    requests[clientindex].body_start = bodystart+4;
+    processheader(client);
 }
 
 void getbodycontentlength(struct client_list_t* client, int newbytes){}
