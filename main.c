@@ -2,6 +2,8 @@
 #define _WIN32_WINNT 0x0600
 #endif
 
+#define _GNU_SOURCE
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <stdio.h>
@@ -93,7 +95,7 @@ struct client_list_t{
 }*client_list, *client_list_start, *client_list_end, *lowest_open_client, *previous_client;
 FD_SET monoclient_set, listener_set, listener_set_main;
 unsigned int numberofcurrentclients;
-int index; //index is set by main() only
+int clientindex; //clientindex is set by main() only
 
 //every function must maintain lowest_open_client before they exit
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
@@ -116,7 +118,7 @@ void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errort
             description = "The request is invalid or cannot be served.";
             break;
         case NOT_FOUND:
-            status = "404 Not Foundgit config --global user.name";
+            status = "404 Not Found";
             description = "The requested resource could not be found.";
             break;
         default:
@@ -138,17 +140,17 @@ void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errort
 }
 
 void initializehttprequestbuffer(struct client_list_t *structtoinit){
-    requests[index].buffersize = DEFAULTREQUESTBUFFERSIZE;
-    requests[index].request = (char *)calloc(requests[index].buffersize, 1);
-    if(!requests[index].request) senderrorresponsetoclient(structtoinit, NOT_ENOUGH_MEMORY);
+    requests[clientindex].buffersize = DEFAULTREQUESTBUFFERSIZE;
+    requests[clientindex].request_end = requests[clientindex].request = (char *)calloc(requests[clientindex].buffersize, 1);
+    if(!requests[clientindex].request) senderrorresponsetoclient(structtoinit, NOT_ENOUGH_MEMORY);
 }
 
 void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
-    if((requests[index].buffersize <<= 1) > 0b100000000000000000000) {
+    if((requests[clientindex].buffersize <<= 1) > 0b100000000000000000000) {
         senderrorresponsetoclient(clienttodouble, TOO_LONG);
         return;
     }
-    if(realloc(requests[index].request, requests[index].buffersize))
+    if(realloc(requests[clientindex].request, requests[clientindex].buffersize))
         senderrorresponsetoclient(clienttodouble, NOT_ENOUGH_MEMORY);
     
 }
@@ -156,7 +158,8 @@ void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
 //to account for the case where lowest_open_client is equal to client_list_end because client_list_end and client_list_start are incorrect when we have 0 clients
 void waitforatleastoneclient(SOCKET _listensock){
     if(lowest_open_client != client_list) EXIT("\nlowest_open_client != client_list   This should never happen");
-    lowest_open_client->sock = accept(_listensock, &addresses[index], sizeof(struct sockaddr_storage));
+    int temp = sizeof(struct sockaddr_storage);
+    lowest_open_client->sock = accept(_listensock, (struct sockaddr *)&addresses[clientindex], &temp);
     initializehttprequestbuffer(lowest_open_client);
     lowest_open_client++;
 }
@@ -164,18 +167,19 @@ void waitforatleastoneclient(SOCKET _listensock){
 void acceptclient(SOCKET _listensock){ //e
     client_list_end->next = lowest_open_client;
     client_list_end = lowest_open_client;
-    lowest_open_client->sock = accept(_listensock, &addresses[index], sizeof(struct sockaddr_storage));
+    int temp = sizeof(struct sockaddr_storage);
+    lowest_open_client->sock = accept(_listensock, (struct sockaddr *)&addresses[clientindex], &temp);
     initializehttprequestbuffer(lowest_open_client);
     while((lowest_open_client++)->sock); //find empty client, the end must always be empty
     numberofcurrentclients++;
 }
 void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary and set all to 0, fix lowest open address and lowest open client, do not call clearclient directly
-    if(!clienttoclear->sock || addresses[index].ss_family || requests[index].buffersize) EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
+    if(!clienttoclear->sock || addresses[clientindex].ss_family || requests[clientindex].buffersize) EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
     if(clienttoclear < lowest_open_client) lowest_open_client = clienttoclear; //min 
     closesocket(clienttoclear->sock);
-    free(requests[index].request); //relieve request buffer
-    memset(&addresses[index], 0, sizeof(addresses[index]));
-    memset(&requests[index], 0, sizeof(requests[index]));
+    free(requests[clientindex].request); //relieve request buffer
+    memset(&addresses[clientindex], 0, sizeof(addresses[clientindex]));
+    memset(&requests[clientindex], 0, sizeof(requests[clientindex]));
     memset(&clienttoclear, 0, sizeof(clienttoclear));
     numberofcurrentclients--;
 }
@@ -196,22 +200,33 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
     clearclient(clienttodelete);
 }
 
+void processheader(struct client_list_t* client){
+    char * lengthtype_s;
+    if(lengthtype_s = strstr(requests->body_start, "Content-Length:"));
+}
+
 void getheader(struct client_list_t* client, int newbytes){//find when the header is complete
     if(!newbytes){
-        senderrorresponsetoclient(client, 500);
-    }else{
-
+        senderrorresponsetoclient(client, BAD_REQUEST);
+        return;
+    }
+    char * startscan = requests[clientindex].request_end - newbytes - 3;
+    if(startscan-requests[clientindex].request < 0) startscan = requests[clientindex].request;
+    char * bodystart = strstr(requests[clientindex].request, "\r\n\r\n");
+    if(bodystart){
+        requests[clientindex].body_start = bodystart+4;
+        processheader(client);
     }
 }
-void processheader(struct client_list_t* client, int newbytes){}
+
 void getbodycontentlength(struct client_list_t* client, int newbytes){}
 void getbodychunked(struct client_list_t* client, int newbytes){}
 void getbodyconnection(struct client_list_t* client, int newbytes){}
 void reply(struct client_list_t* client, int newbytes){}
 
 int main(){
-    //if a function is called with a socket, you must set index to lowest open client
-    //if a function is called with a client struct pointer you must set index to that client
+    //if a function is called with a socket, you must set clientindex to lowest open client
+    //if a function is called with a client struct pointer you must set clientindex to that client
     WSADATA startup;
     if(WSAStartup(MAKEWORD(2, 2), &startup)) EXIT("WSAStartup()\n");
     printwsadata(&startup);
@@ -226,7 +241,7 @@ int main(){
     client_list_start = client_list, client_list_end = client_list;
     lowest_open_client = client_list;// when remove a client check to see if it's lower, when add a client, move up to next empty space, == maxclients means full
     numberofcurrentclients = 0;
-    void *(*handlers)(struct client_list_t*, int) = {&getheader, &getbodycontentlength, &getbodychunked, &getbodyconnection, &reply};
+    void (*handlers[])(struct client_list_t*, int) = {&getheader, &getbodycontentlength, &getbodychunked, &getbodyconnection, &reply};
     while(1){
         //check listening socket with select by copying its fdset
         //if new client available add it to the front the list and store it in lowest_open_client
@@ -240,10 +255,10 @@ int main(){
                 if(numberofcurrentclients > MAXCLIENTS){EXIT("\nnumberofcurrentclients out of bounds, how did that happen???"); //debug statements basically
                 if(lowest_open_client-client_list == MAXCLIENTS-1 && numberofcurrentclients != MAXCLIENTS) EXIT("\nnumberofcurrentclients and lowest_opem_client disagree! UR screwed!");
                 }else if(numberofcurrentclients == MAXCLIENTS){
-                    index = client_list_start-client_list;
+                    clientindex = client_list_start-client_list;
                     replaceoldestclient(listensock);
                 }else if(numberofcurrentclients > 0){
-                    index = lowest_open_client-client_list;
+                    clientindex = lowest_open_client-client_list;
                     acceptclient(listensock);
                 }
             }
@@ -251,17 +266,17 @@ int main(){
         struct client_list_t * currentclient;
         previous_client = currentclient = client_list_start; //if currentclient == previous_client we know not to link back or else we create an infinite loop
         do{ //must maintain previous_client
-            index = currentclient-client_list;
+            clientindex = currentclient-client_list;
             FD_ZERO(&monoclient_set);
             FD_SET(currentclient->sock, &monoclient_set);
             struct timeval timeout = {0, 0};
             select(0, &monoclient_set, 0, 0, &timeout);
             if(FD_ISSET(currentclient->sock, &monoclient_set)){
-                int bufferremaining = requests[index].buffersize - (requests[index].request_end - requests[index].request);
+                int bufferremaining = requests[clientindex].buffersize - (requests[clientindex].request_end - requests[clientindex].request);
                 if(bufferremaining == 0) doubleclientrequestbuffer(currentclient);
-                int newbytes = recv(currentclient->sock, requests[index].request, bufferremaining, 0);
+                int newbytes = recv(currentclient->sock, requests[clientindex].request, bufferremaining, 0);
                 if(newbytes == SOCKET_ERROR) EXIT("recv() in main failed for some reason.");
-                (handlers+requests[index].handlerindex)(currentclient, newbytes);
+                (*(handlers+requests[clientindex].handlerindex))(currentclient, newbytes);
             }
             previous_client = currentclient;
         }while(currentclient = currentclient->next);//this is fine cause if we have 0 clients we just wait for accept();
