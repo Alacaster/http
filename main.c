@@ -7,8 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include "getaddr.h"
+#include <time.h> 
+
+#define EXIT(message) do { fprintf(stderr, message); exit(1); } while(0)
 
 void printwsadata(WSADATA *a){
     union {
