@@ -6,6 +6,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <wininet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,11 +98,10 @@ struct client_list_t{
 FD_SET monoclient_set, listener_set, listener_set_main;
 unsigned int numberofcurrentclients;
 int clientindex; //clientindex is set by main() only
-jmp_buf environment;
 
 //every function must maintain lowest_open_client before they exit
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
-enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404};
+enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404, NOT_IMPLIMENTED = 501};
 void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errortype_t error){
     char response[1024];
     const char *status;
@@ -122,6 +122,10 @@ void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errort
         case NOT_FOUND:
             status = "404 Not Found";
             description = "The requested resource could not be found.";
+            break;
+        case NOT_IMPLIMENTED:
+            status = "501 Not Implimented";
+            description = "The sever could not process your request.";
             break;
         default:
             status = "500 Internal Server Error";
@@ -203,8 +207,9 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
 }
 enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
 #define HEADER_FIELD_FORMAT_ERROR -1
+#define MAX_DATE_LENGTH 40
 char * extractfieldfromstring(const char* str, char* const strend, void * const outvalue, const enum fieldtype_t fieldtype){
-    //returns the value in outvalue and returns a pointer to the beginning of the field including the field name, if field is not found returns NULL
+    //returns the value in outvalue if not NULL and returns a pointer to the beginning of the field including the field name, if field is not found returns NULL, if field is incorrectly formatted returns -1
     char * field;
     switch (fieldtype) {
         case CONTENT_LENGTH: field = "content-length:"; break;
@@ -229,7 +234,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
     char *returnstr;
     const int fieldlen = strlen(field);
     {
-        char * tempstrend = strend - fieldlen+1;
+        char * tempstrend = strend - (fieldlen+1);
         while(str < tempstrend){
             int a;
             for(a = 0; a < fieldlen; a++){
@@ -248,7 +253,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
         }
     }
     char *fieldend = strstr(str, "\r");
-    if(!fieldend) return -1;
+    if(!fieldend) return HEADER_FIELD_FORMAT_ERROR;
     enum returntype_t {LONG_INT, DOUBLE, TIME, STRING} returntype = STRING;
     switch (fieldtype) {
         case CONTENT_LENGTH: returntype = LONG_INT; break;
@@ -273,37 +278,63 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
     switch (returntype) {
         case LONG_INT: 
             while(!isdigit(str) && str < fieldend) str++;
-            if(fieldend == str) return -1;
-            *((long int*)outvalue) = strtol(str, NULL, 10);
+            if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
+            if(!outvalue) *((long int*)outvalue) = strtol(str, NULL, 10);
             break;
         case DOUBLE:
             while(!isdigit(str) && str < fieldend) str++;
-            if(fieldend == str) return -1;
-            *((long int*)outvalue) = strtol(str, NULL, 10);
+            if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
+            if(!outvalue) *((double*)outvalue) = strtod(str, NULL);
             break;
-        case TIME: break;
-        case STRING: break;
-        default:
-            EXIT("\nUnsupported field in extractfieldfromstring()");
+        case TIME: {
+                while(!isprint(str) && str < fieldend) str++;
+                if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
+                if(!fieldend || fieldend-str > MAX_DATE_LENGTH) return HEADER_FIELD_FORMAT_ERROR;
+                char tempdate[fieldend - str];
+                strncpy(tempdate, str, sizeof(tempdate));
+                tempdate[sizeof(tempdate)-1] = '\0';
+                if(!outvalue && !InternetTimeToSystemTime(tempdate,(SYSTEMTIME*)outvalue, 0))
+                    return HEADER_FIELD_FORMAT_ERROR;
+                break;
+            }
+        case STRING:
+            while(!isprint(str) && str < fieldend) str++;
+            *((char *)outvalue) = str;
+            break;
+        default: break;
     }
     return returnstr;
 }
 
 void processheader(struct client_list_t* client){
-    char * lengthtype_s;
-    if(lengthtype_s = strstr(requests->body_start, "Content-Length:")){
-        requests[clientindex].http_header.content_length_s = lengthtype_s;
-        lengthtype_s+=strlen("Content-Length:");
-        char * a = lengthtype_s;
-        while(isspace(a) || *a != '\r') a++;
-        if(isdigit(a)) lengthtype_s = a;
-        while(*a != '\r') a++;
-        *a = '\0';
-        requests[clientindex].http_header.content_length = atoi(lengthtype_s);
-        requests[clientindex].handlerindex = FN_GETBODYCONTENTLENGTH;
-    }else if(lengthtype_s = strstr(requests->body_start, "Transfer-Encoding: chunked")){
-        requests[clientindex].handlerindex = FN_GETBODYCHUNKED;
-    }else {requests[clientindex].handlerindex = FN_GETBODYCONNECTION;}
+    int length = 0;
+    char* fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].request_end, &length, CONTENT_LENGTH);
+    if(fieldstart){
+        if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
+            senderrorresponsetoclient(client, BAD_REQUEST); 
+            return;
+        }else{
+            requests[clientindex].http_header.content_length = length;
+            requests[clientindex].handlerindex = FN_GETBODYCONTENTLENGTH;
+            return;
+        }
+    }
+    char * transferencoding;
+    fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].request_end, transferencoding, TRANSFER_ENCODING);
+    if(fieldstart){
+        if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
+            senderrorresponsetoclient(client, BAD_REQUEST);
+            return;
+        }else{
+            if(requests[clientindex].request_end<transferencoding+strlen("chunked")-1 || strncmp("chunked", transferencoding, strlen("chunked"))){
+                senderrorresponsetoclient(client, NOT_IMPLIMENTED);
+                return;
+            }
+            requests[clientindex].handlerindex = FN_GETBODYCHUNKED;
+            return;
+        }
+    }
+    requests[clientindex].handlerindex = FN_GETBODYCONNECTION;
 }
 
 void getheader(struct client_list_t* client, int newbytes){//find when the header is complete
@@ -376,6 +407,7 @@ int main(){
                 if(bufferremaining == 0) doubleclientrequestbuffer(currentclient);
                 int newbytes = recv(currentclient->sock, requests[clientindex].request, bufferremaining, 0);
                 if(newbytes == SOCKET_ERROR) EXIT("recv() in main failed for some reason.");
+                requests[clientindex].request_end += newbytes-1;
                 (*(handlers+requests[clientindex].handlerindex))(currentclient, newbytes);
             }
             previous_client = currentclient;
