@@ -9,7 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h> 
+#include <time.h>
+#include <setjmp.h>
 
 #define EXIT(message) do { fprintf(stderr, message); exit(1); } while(0)
 
@@ -70,7 +71,7 @@ const char * getmimetypefromstringconst(const char * type){
     return "application/octet-stream";
 }
 
-enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404};
+
 enum functionhandler {FN_GETHEADER, FN_GETBODYCONTENTLENGTH, FN_GETBODYCHUNKED, FN_GETBODYCONNECTION};
 #define MAXCLIENTS 30
 #define DEFAULTREQUESTBUFFERSIZE 0b10000000000
@@ -96,10 +97,11 @@ struct client_list_t{
 FD_SET monoclient_set, listener_set, listener_set_main;
 unsigned int numberofcurrentclients;
 int clientindex; //clientindex is set by main() only
+jmp_buf environment;
 
 //every function must maintain lowest_open_client before they exit
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
-
+enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404};
 void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errortype_t error){
     char response[1024];
     const char *status;
@@ -199,6 +201,93 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
     }
     clearclient(clienttodelete);
 }
+enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
+#define HEADER_FIELD_FORMAT_ERROR -1
+char * extractfieldfromstring(const char* str, char* const strend, void * const outvalue, const enum fieldtype_t fieldtype){
+    //returns the value in outvalue and returns a pointer to the beginning of the field including the field name, if field is not found returns NULL
+    char * field;
+    switch (fieldtype) {
+        case CONTENT_LENGTH: field = "content-length:"; break;
+        case HOST: field = "host:"; break;
+        case TRANSFER_ENCODING: field = "transfer-encoding:"; break;
+        case CONNECTION: field = "connection:"; break;
+        case USER_AGENT: field = "user-agent:"; break;
+        case ACCEPT_LANGUAGE: field = "accept-language:"; break;
+        case ACCEPT: field = "accept:"; break;
+        case ACCEPT_ENCODING: field = "accept-encoding:"; break;
+        case CONTENT_TYPE: field = "content-type:"; break;
+        case CACHE_CONTROL: field = "cache-control:"; break;
+        case DATE: field = "date:"; break;
+        case ETAG: field = "etag:"; break;
+        case EXPIRES: field = "expires:"; break;
+        case LAST_MODIFIED: field = "last-modified:"; break;
+        case SERVER: field = "server:"; break;
+        case X_CACHE: field = "x-cache:"; break;
+        default:
+            EXIT("\nUnsupported field in extractfieldfromstring()");
+    }
+    char *returnstr;
+    const int fieldlen = strlen(field);
+    {
+        char * tempstrend = strend - fieldlen+1;
+        while(str < tempstrend){
+            int a;
+            for(a = 0; a < fieldlen; a++){
+                if(tolower(str[a]) != field[a]) {
+                    str++;
+                    goto continuewhile;
+                }
+            }
+            returnstr = str;
+            str += a;
+            break;
+            continuewhile:
+        }
+        if(str == tempstrend){
+            return NULL;
+        }
+    }
+    char *fieldend = strstr(str, "\r");
+    if(!fieldend) return -1;
+    enum returntype_t {LONG_INT, DOUBLE, TIME, STRING} returntype = STRING;
+    switch (fieldtype) {
+        case CONTENT_LENGTH: returntype = LONG_INT; break;
+        case HOST: break;
+        case TRANSFER_ENCODING: break;
+        case CONNECTION: break;
+        case USER_AGENT: break;
+        case ACCEPT_LANGUAGE: break;
+        case ACCEPT: break;
+        case ACCEPT_ENCODING: break;
+        case CONTENT_TYPE: break;
+        case CACHE_CONTROL: break;
+        case DATE: returntype = TIME; break;
+        case ETAG: break;
+        case EXPIRES: break;
+        case LAST_MODIFIED: returntype = TIME; break;
+        case SERVER: break;
+        case X_CACHE: break;
+        default:
+            EXIT("\nUnsupported field in extractfieldfromstring()");
+    }
+    switch (returntype) {
+        case LONG_INT: 
+            while(!isdigit(str) && str < fieldend) str++;
+            if(fieldend == str) return -1;
+            *((long int*)outvalue) = strtol(str, NULL, 10);
+            break;
+        case DOUBLE:
+            while(!isdigit(str) && str < fieldend) str++;
+            if(fieldend == str) return -1;
+            *((long int*)outvalue) = strtol(str, NULL, 10);
+            break;
+        case TIME: break;
+        case STRING: break;
+        default:
+            EXIT("\nUnsupported field in extractfieldfromstring()");
+    }
+    return returnstr;
+}
 
 void processheader(struct client_list_t* client){
     char * lengthtype_s;
@@ -222,8 +311,8 @@ void getheader(struct client_list_t* client, int newbytes){//find when the heade
         senderrorresponsetoclient(client, BAD_REQUEST);
         return;
     }
-    char * startscan = requests[clientindex].request_end - newbytes - 3;
-    if(startscan-requests[clientindex].request < 0) startscan = requests[clientindex].request;
+    char * startscan = requests[clientindex].request_end - newbytes - 3;//go back to not split "\r\n\r\n" in half
+    if(startscan-requests[clientindex].request < 0) startscan = requests[clientindex].request; //don't overflow
     char * bodystart = strstr(startscan, "\r\n\r\n");
     if(!bodystart) return;
     requests[clientindex].body_start = bodystart+4;
@@ -283,7 +372,7 @@ int main(){
             struct timeval timeout = {0, 0};
             select(0, &monoclient_set, 0, 0, &timeout);
             if(FD_ISSET(currentclient->sock, &monoclient_set)){
-                int bufferremaining = requests[clientindex].buffersize - (requests[clientindex].request_end - requests[clientindex].request);
+                int bufferremaining = requests[clientindex].buffersize - (requests[clientindex].request_end - requests[clientindex].request) - 1;
                 if(bufferremaining == 0) doubleclientrequestbuffer(currentclient);
                 int newbytes = recv(currentclient->sock, requests[clientindex].request, bufferremaining, 0);
                 if(newbytes == SOCKET_ERROR) EXIT("recv() in main failed for some reason.");
