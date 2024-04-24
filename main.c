@@ -395,7 +395,11 @@ void getbodychunked(struct client_list_t* client, int newbytes){
         bodyindex[clientindex] += bytelength;
     }
 }
-void getbodyconnection(struct client_list_t* client, int newbytes){}
+void getbodyconnection(struct client_list_t* client, int newbytes){
+    if(newbytes) return;
+    if(connect(client->sock, &addresses[clientindex], sizeof(SOCKADDR_STORAGE))) return;
+    reply(client);
+}
 void reply(struct client_list_t* client){}
 
 int main(){
