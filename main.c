@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <setjmp.h>
 
 #define EXIT(message) do { fprintf(stderr, message); exit(1); } while(0)
 
@@ -87,8 +86,9 @@ struct http_request_t{
     enum functionhandler handlerindex; //specifies a function to handle the client each time it is addressed
     unsigned long buffersize;
     char *request;
-    char *request_end;
+    char *request_end; //points at the last character of the stirng
     char *body_start;
+    clock_t timeout;
 } *requests;
 struct sockaddr_storage *addresses;
 struct client_list_t{
@@ -103,52 +103,60 @@ int clientindex; //clientindex is set by main() only
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
 enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404, NOT_IMPLIMENTED = 501};
 void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errortype_t error){
-    char response[1024];
-    const char *status;
-    const char *description;
-    switch (error) {
-        case TOO_LONG:
-            status = "414 URI Too Long";
-            description = "The requested URI is too long.";
-            break;
-        case NOT_ENOUGH_MEMORY:
-            status = "507 Insufficient Storage";
-            description = "The server does not have enough memory to process the request.";
-            break;
-        case BAD_REQUEST:
-            status = "400 Bad Request";
-            description = "The request is invalid or cannot be served.";
-            break;
-        case NOT_FOUND:
-            status = "404 Not Found";
-            description = "The requested resource could not be found.";
-            break;
-        case NOT_IMPLIMENTED:
-            status = "501 Not Implimented";
-            description = "The sever could not process your request.";
-            break;
-        default:
-            status = "500 Internal Server Error";
-            description = "An unexpected error occurred on the server.";
-            break;
+    FD_SET sendset;
+    FD_ZERO(&sendset);
+    FD_SET(clienttoclose->sock, &sendset);
+    select(0, NULL, &sendset, NULL, NULL);
+    if(FD_ISSET(clienttoclose->sock, &sendset)){
+        char response[1024];
+        const char *status;
+        const char *description;
+        switch (error) {
+            case TOO_LONG:
+                status = "414 URI Too Long";
+                description = "The requested URI is too long.";
+                break;
+            case NOT_ENOUGH_MEMORY:
+                status = "507 Insufficient Storage";
+                description = "The server does not have enough memory to process the request.";
+                break;
+            case BAD_REQUEST:
+                status = "400 Bad Request";
+                description = "The request is invalid or cannot be served.";
+                break;
+            case NOT_FOUND:
+                status = "404 Not Found";
+                description = "The requested resource could not be found.";
+                break;
+            case NOT_IMPLIMENTED:
+                status = "501 Not Implimented";
+                description = "The sever could not process your request.";
+                break;
+            default:
+                status = "500 Internal Server Error";
+                description = "An unexpected error occurred on the server.";
+                break;
+        }
+        snprintf(response, sizeof(response),
+                    "HTTP/1.1 %s\r\n"
+                    "Content-Type: text/plain\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "%s",
+                    status, strlen(description), description);
+        printf("\nClient was cut off due to error: %s", status);
+        send(clienttoclose->sock, response, strlen(response), 0);
     }
-    snprintf(response, sizeof(response),
-             "HTTP/1.1 %s\r\n"
-             "Content-Type: text/plain\r\n"
-             "Content-Length: %zu\r\n"
-             "Connection: close\r\n"
-             "\r\n"
-             "%s",
-             status, strlen(description), description);
-    printf("\nClient was cut off due to error: %s", status);
-    send(clienttoclose->sock, response, strlen(response), 0);
     deleteclientandsplicelist(clienttoclose);
 }
 
 void initializehttprequestbuffer(struct client_list_t *structtoinit){
     requests[clientindex].buffersize = DEFAULTREQUESTBUFFERSIZE;
     requests[clientindex].request_end = requests[clientindex].request = (char *)calloc(requests[clientindex].buffersize, 1);
+    requests[clientindex].request_end--;
     if(!requests[clientindex].request) senderrorresponsetoclient(structtoinit, NOT_ENOUGH_MEMORY);
+    requests[clientindex].timeout = clock();
 }
 
 void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
@@ -308,7 +316,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
 
 void processheader(struct client_list_t* client){
     int length = 0;
-    char* fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].request_end, &length, CONTENT_LENGTH);
+    char* fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, &length, CONTENT_LENGTH);
     if(fieldstart){
         if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
             senderrorresponsetoclient(client, BAD_REQUEST); 
@@ -320,7 +328,7 @@ void processheader(struct client_list_t* client){
         }
     }
     char * transferencoding;
-    fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].request_end, transferencoding, TRANSFER_ENCODING);
+    fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, transferencoding, TRANSFER_ENCODING);
     if(fieldstart){
         if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
             senderrorresponsetoclient(client, BAD_REQUEST);
@@ -350,10 +358,17 @@ void getheader(struct client_list_t* client, int newbytes){//find when the heade
     processheader(client);
 }
 
-void getbodycontentlength(struct client_list_t* client, int newbytes){}
-void getbodychunked(struct client_list_t* client, int newbytes){}
+void getbodycontentlength(struct client_list_t* client, int newbytes){
+    if(requests[clientindex].request_end - (requests[clientindex].body_start-1) < requests[clientindex].http_header.content_length){
+        return;
+    }
+    reply(client);
+}
+void getbodychunked(struct client_list_t* client, int newbytes){
+    sscanf(" %lx\r\n");
+}
 void getbodyconnection(struct client_list_t* client, int newbytes){}
-void reply(struct client_list_t* client, int newbytes){}
+void reply(struct client_list_t* client){}
 
 int main(){
     //if a function is called with a socket, you must set clientindex to lowest open client
@@ -398,6 +413,8 @@ int main(){
         previous_client = currentclient = client_list_start; //if currentclient == previous_client we know not to link back or else we create an infinite loop
         do{ //must maintain previous_client
             clientindex = currentclient-client_list;
+            if((clock() - requests[clientindex].timeout) / CLOCKS_PER_SEC > 5)
+                deleteclientandsplicelist(currentclient);
             FD_ZERO(&monoclient_set);
             FD_SET(currentclient->sock, &monoclient_set);
             struct timeval timeout = {0, 0};
@@ -407,7 +424,7 @@ int main(){
                 if(bufferremaining == 0) doubleclientrequestbuffer(currentclient);
                 int newbytes = recv(currentclient->sock, requests[clientindex].request, bufferremaining, 0);
                 if(newbytes == SOCKET_ERROR) EXIT("recv() in main failed for some reason.");
-                requests[clientindex].request_end += newbytes-1;
+                requests[clientindex].request_end += newbytes;
                 (*(handlers+requests[clientindex].handlerindex))(currentclient, newbytes);
             }
             previous_client = currentclient;
