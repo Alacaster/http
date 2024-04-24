@@ -359,13 +359,41 @@ void getheader(struct client_list_t* client, int newbytes){//find when the heade
 }
 
 void getbodycontentlength(struct client_list_t* client, int newbytes){
+    if(!newbytes){
+        senderrorresponsetoclient(client, BAD_REQUEST);
+        return;
+    }
     if(requests[clientindex].request_end - (requests[clientindex].body_start-1) < requests[clientindex].http_header.content_length){
         return;
     }
     reply(client);
 }
 void getbodychunked(struct client_list_t* client, int newbytes){
-    sscanf(" %lx\r\n");
+    if(!newbytes){
+        senderrorresponsetoclient(client, BAD_REQUEST);
+        return;
+    }
+    static int bodyindex[MAXCLIENTS] = {0}; //points to the place where the next chunked length should be as added to body_start
+    int bytelength;
+    while(requests[clientindex].body_start + bodyindex[clientindex] <= requests[clientindex].request_end){
+        int chunklengthlinelength; //perhaps there is no newline after a 0 chunk?
+        char * checkfornewline = strstr(requests[clientindex].body_start + bodyindex[clientindex], "\r\n");
+        if(!checkfornewline) return;
+        chunklengthlinelength = (requests[clientindex].body_start+bodyindex[clientindex]) - checkfornewline;
+        chunklengthlinelength+=2;
+        if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], " %lx", &bytelength)) senderrorresponsetoclient(client, BAD_REQUEST);
+        if(!bytelength){
+            requests[clientindex].request_end = requests[clientindex].body_start + (bodyindex[clientindex] - 1);
+            bodyindex[clientindex] = 0;
+            reply(client);
+        }
+        bytelength+=2;
+        for(int i = bodyindex[clientindex]; i + chunklengthlinelength + requests[clientindex].body_start <= requests[clientindex].request_end; i++){
+            requests[clientindex].body_start[i] = requests[clientindex].body_start[i+chunklengthlinelength];
+        }
+        requests[clientindex].request_end -= chunklengthlinelength;
+        bodyindex[clientindex] += bytelength;
+    }
 }
 void getbodyconnection(struct client_list_t* client, int newbytes){}
 void reply(struct client_list_t* client){}
