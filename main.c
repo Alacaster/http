@@ -71,18 +71,21 @@ const char * getmimetypefromstringconst(const char * type){
     return "application/octet-stream";
 }
 
-
 enum functionhandler {FN_GETHEADER, FN_GETBODYCONTENTLENGTH, FN_GETBODYCHUNKED, FN_GETBODYCONNECTION};
 #define MAXCLIENTS 30
 #define DEFAULTREQUESTBUFFERSIZE 0b10000000000
-struct client_list_t;
+struct http_header_data_t{
+        char host[1024];
+        char path[2048];
+        char useragent[4096];
+        char contenttype[256];
+        SYSTEMTIME time;
+        char connection : 1; //1 is keepalive 0 is close
+        char requesttype : 2; //enum {ERROR, GET, POST, HEAD}
+};
 struct http_request_t{
-    struct http_header_data_t{
-        char * host_s;
-        char * content_type;
-        char * content_length_s;
-        int content_length;
-    } http_header;
+    struct http_header_data_t * http_header;
+    int content_length;
     enum functionhandler handlerindex; //specifies a function to handle the client each time it is addressed
     unsigned long buffersize;
     char *request;
@@ -91,6 +94,7 @@ struct http_request_t{
     clock_t timeout;
 } *requests;
 struct sockaddr_storage *addresses;
+struct client_list_t;
 struct client_list_t{
     SOCKET sock;
     struct client_list_t *next;
@@ -187,6 +191,7 @@ void acceptclient(SOCKET _listensock){ //e
     while((lowest_open_client++)->sock); //find empty client, the end must always be empty
     numberofcurrentclients++;
 }
+
 void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary and set all to 0, fix lowest open address and lowest open client, do not call clearclient directly
     if(!clienttoclear->sock || addresses[clientindex].ss_family || requests[clientindex].buffersize) EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
     if(clienttoclear < lowest_open_client) lowest_open_client = clienttoclear; //min 
@@ -213,6 +218,7 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
     }
     clearclient(clienttodelete);
 }
+
 enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
 #define HEADER_FIELD_FORMAT_ERROR -1
 #define MAX_DATE_LENGTH 40
@@ -247,7 +253,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
             int a;
             for(a = 0; a < fieldlen; a++){
                 if(tolower(str[a]) != field[a]) {
-                    str++;
+                    str+=a;
                     goto continuewhile;
                 }
             }
@@ -314,7 +320,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
     return returnstr;
 }
 
-void processheader(struct client_list_t* client){
+void getbodylengthtypefromheader(struct client_list_t* client){
     int length = 0;
     char* fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, &length, CONTENT_LENGTH);
     if(fieldstart){
@@ -322,7 +328,7 @@ void processheader(struct client_list_t* client){
             senderrorresponsetoclient(client, BAD_REQUEST); 
             return;
         }else{
-            requests[clientindex].http_header.content_length = length;
+            requests[clientindex].content_length = length;
             requests[clientindex].handlerindex = FN_GETBODYCONTENTLENGTH;
             return;
         }
@@ -355,7 +361,7 @@ void getheader(struct client_list_t* client, int newbytes){//find when the heade
     char * bodystart = strstr(startscan, "\r\n\r\n");
     if(!bodystart) return;
     requests[clientindex].body_start = bodystart+4;
-    processheader(client);
+    getbodylengthtypefromheader(client);
 }
 
 void getbodycontentlength(struct client_list_t* client, int newbytes){
@@ -363,7 +369,7 @@ void getbodycontentlength(struct client_list_t* client, int newbytes){
         senderrorresponsetoclient(client, BAD_REQUEST);
         return;
     }
-    if(requests[clientindex].request_end - (requests[clientindex].body_start-1) < requests[clientindex].http_header.content_length){
+    if(requests[clientindex].request_end - (requests[clientindex].body_start-1) < requests[clientindex].content_length){
         return;
     }
     reply(client);
@@ -381,14 +387,14 @@ void getbodychunked(struct client_list_t* client, int newbytes){
         if(!checkfornewline) return;
         chunklengthlinelength = (requests[clientindex].body_start+bodyindex[clientindex]) - checkfornewline;
         chunklengthlinelength+=2;
-        if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], " %lx", &bytelength)) senderrorresponsetoclient(client, BAD_REQUEST);
+        if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], " %x", &bytelength)) senderrorresponsetoclient(client, BAD_REQUEST);
         if(!bytelength){
             requests[clientindex].request_end = requests[clientindex].body_start + (bodyindex[clientindex] - 1);
             bodyindex[clientindex] = 0;
             reply(client);
         }
         bytelength+=2;
-        for(int i = bodyindex[clientindex]; i + chunklengthlinelength + requests[clientindex].body_start <= requests[clientindex].request_end; i++){
+        for(int i = bodyindex[clientindex]; (i + chunklengthlinelength) + requests[clientindex].body_start <= requests[clientindex].request_end; i++){
             requests[clientindex].body_start[i] = requests[clientindex].body_start[i+chunklengthlinelength];
         }
         requests[clientindex].request_end -= chunklengthlinelength;
@@ -400,7 +406,114 @@ void getbodyconnection(struct client_list_t* client, int newbytes){
     if(connect(client->sock, &addresses[clientindex], sizeof(SOCKADDR_STORAGE))) return;
     reply(client);
 }
-void reply(struct client_list_t* client){}
+
+const struct http_header_data_t * loadheaderdata(struct client_list_t * client){
+    // Function returns a pointer to a static struct http_header_data_t.
+    // The function first checks for the request method (POST, GET, HEAD) on the first line.
+    // If a '\r' character is present, it null-terminates the first line and then resets the character after finishing parsing.
+    // If no '\r' is found, it continues without modification. The allocated buffer is always null-terminated
+    // because it is calloc'd and the buffer size is kept 1 less than the allocated size.
+    // The function loads the path string that comes after the '/' character.
+    // It does not consider anything for the http version
+    // It has a bug where if the strings (POST, GET, HEAD) are in the path or somewhere they shouldn't be and NOT before there
+    // it will interpret the request that way which could be bad.
+    // It then iterates through the string from the beginning to the end minus the "\r\n\r\n" sequence,
+    // which would have been found by getheader() (the only reason this function is called).
+    // For each character, if it is ':', the function checks if the preceding characters match any of the fields
+    // defined in the fieldstwings array, which contains pointers to each field and their lengths.
+    // The comparison is done by scanning backwards up to the length of the field string minus 1,
+    // while converting the characters from the buffer to lowercase using tolower().
+    // or up to the last valid character which is kept track of, but cannot be before the beginning of the string
+    // this handles overflow.
+    // If a match is found, a switch statement is called based on the index of the matched field in the fieldstwings array.
+    // The matched field pointer is set to 0 to mark it as processed, and the corresponding field is handled accordingly.
+    // The function uses sscanf_s to extract and convert (if necessary) the argument after the ':' character.
+    // sscanf_s disregards leading whitespace and stops at trailing whitespace due to the format specifiers,
+    // except when parsing the date field.
+    // When parsing the connection field, the string after "connection:" is copied and converted to lowercase using strlwr().
+    // The function then checks if "close" or "keep-alive" is present in the string. It will match even if the keyword
+    // is surrounded by other characters (e.g., "iwe7rbweclosecibueipuw" or "close 2938nefnei"), which is intended.
+    // However, if the keyword appears after the first whitespace (e.g., "connection: wubrw9r8 close"), it will not match.
+    static struct http_header_data_t out;
+    requests[clientindex].http_header = &out;
+    char * lastalnum = 0;
+    char * mainstringpos = requests[clientindex].request;
+    char * tempend = strchr(mainstringpos, '\r');
+    if(tempend) *tempend = '\0';
+    if(strstr(mainstringpos, "GET")){out.requesttype = 1;
+    }else if(strstr(mainstringpos, "POST")){out.requesttype = 2;
+    }else if(strstr(mainstringpos, "HEAD")){out.requesttype = 3;}else{senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
+    char *pathtemp = strchr(mainstringpos, '/');
+    if(!pathtemp){return 1;}
+    if(sscanf_s(pathtemp, "%s", out.path, sizeof(out.path))){senderrorresponsetoclient(client, TOO_LONG); return 1;}
+    if(tempend) *tempend = '\0';
+        //path and request type complete
+    mainstringpos = requests[clientindex].request;
+    struct string_t {const char * string; int len;} fieldstwings[] = {
+        {"host:", 6},
+        {"user-agent:", 12}, 
+        {"content-type:", 14},
+        {"connection:", 12},
+        {"date:", 6}};
+    char * lastvalidchar = 0;
+    while(mainstringpos < requests[clientindex].body_start - 4){
+        if(!lastvalidchar && (isalnum(*mainstringpos) || *mainstringpos == '-' || *mainstringpos == ':')){
+            lastvalidchar = mainstringpos;
+        }else if(lastvalidchar && !(isalnum(*mainstringpos) || *mainstringpos == '-' || *mainstringpos == ':')){
+            lastvalidchar = 0;
+        }
+        if(*mainstringpos == ':'){
+            for(int x = 0; x < sizeof(fieldstwings)/sizeof(struct string_t); x++){
+                if(fieldstwings[x].string){
+                for(int i = 0; mainstringpos-i > lastvalidchar && i < fieldstwings[x].len; i++){
+                    if(tolower(*(mainstringpos-i)) != *(fieldstwings[x].string-i)){
+                        goto nomatch;
+                    }
+                }
+                struct string_t type;
+                switch(x){
+                    case 0:
+                        type.string = out.host; type.len = sizeof(out.host);
+                        goto getstring;
+                    case 1:
+                        type.string = out.useragent; type.len = sizeof(out.useragent);
+                        goto getstring;
+                    case 2:
+                        type.string = out.contenttype; type.len = sizeof(out.contenttype);
+                        getstring:
+                        fieldstwings[x].string = 0;
+                        if(sscanf_s(mainstringpos+1, "%s", type.string, type.len) == EOF){senderrorresponsetoclient(client, TOO_LONG); return 1;}
+                        break;
+                    case 3:
+                        char connection[100];
+                        memset(connection, 0, sizeof(connection));
+                        if(sscanf_s(mainstringpos+1, "%s", connection, sizeof(connection))){senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
+                        strlwr(connection);
+                        if(strstr(connection, "close")){out.connection = 0;}else
+                        if(strstr(connection, "keep-alive")){out.connection = 1;}else{
+                            senderrorresponsetoclient(client, BAD_REQUEST);
+                        }
+                        fieldstwings[x].string = 0;
+                        break;
+                    case 4:
+                        char connection[MAX_DATE_LENGTH];
+                        memset(connection, 0, sizeof(connection));
+                        if(sscanf_s(mainstringpos+1, "%40[^\t\n\v\f\r]", connection, sizeof(connection))){senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
+                        if(!InternetTimeToSystemTimeA(connection, &out.time, 0)){senderrorresponsetoclient(client, 0); return 1;}
+                        fieldstwings[x].string = 0;
+                        break;
+                }
+                break;
+                }
+                nomatch:
+            }
+        }
+    }
+}
+
+void reply(struct client_list_t* client){
+
+}
 
 int main(){
     //if a function is called with a socket, you must set clientindex to lowest open client
