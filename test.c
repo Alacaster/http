@@ -1,12 +1,12 @@
 #include <stdio.h>
 
 int main() {
-    const char test_buffer[] = "user-agent: wallflowser.exe\r\nsexy-marinara: none\r\n\r\n";
-    char input_line[100];
-
-    sscanf(test_buffer, "%10[^-]", input_line);
-
-    printf("Read line: %s\n", input_line);
+    FILE * manifest = fopen("manifest.txt", "r");
+    char string[100];
+    while(EOF != fscanf_s(manifest, "%[^\r\n] ", string, sizeof(string))){
+        printf("%s\n", string);
+    }
+    
 
     return 0;
 }

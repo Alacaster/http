@@ -7,10 +7,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <wininet.h>
+#include <shlwapi.h>
+#include <sysinfoapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 
 #define EXIT(message) do { fprintf(stderr, message); exit(1); } while(0)
 
@@ -76,7 +79,7 @@ enum functionhandler {FN_GETHEADER, FN_GETBODYCONTENTLENGTH, FN_GETBODYCHUNKED, 
 #define DEFAULTREQUESTBUFFERSIZE 0b10000000000
 struct http_header_data_t{
         char host[1024];
-        char path[2048];
+        char path[MAX_PATH];
         char useragent[4096];
         char contenttype[256];
         SYSTEMTIME time;
@@ -91,7 +94,7 @@ struct http_request_t{
     char *request;
     char *request_end; //points at the last character of the stirng
     char *body_start;
-    clock_t timeout;
+    uint64_t timeout;
 } *requests;
 struct sockaddr_storage *addresses;
 struct client_list_t;
@@ -160,7 +163,17 @@ void initializehttprequestbuffer(struct client_list_t *structtoinit){
     requests[clientindex].request_end = requests[clientindex].request = (char *)calloc(requests[clientindex].buffersize, 1);
     requests[clientindex].request_end--;
     if(!requests[clientindex].request) senderrorresponsetoclient(structtoinit, NOT_ENOUGH_MEMORY);
-    requests[clientindex].timeout = clock();
+    requests[clientindex].timeout = GetTickCount64();
+}
+void resetclienthttprequestbuffer(struct client_list_t *structtoreset){
+    requests[clientindex].buffersize = DEFAULTREQUESTBUFFERSIZE;
+    free(requests[clientindex].request);
+    requests[clientindex].request_end = requests[clientindex].request = (char *)calloc(requests[clientindex].buffersize, 1);
+    requests[clientindex].request_end--;
+    requests[clientindex].handlerindex = 0;
+    requests[clientindex].body_start = 0;
+    requests[clientindex].timeout = GetTickCount64() + 300000;
+    requests[clientindex].http_header = 0;
 }
 
 void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
@@ -170,7 +183,6 @@ void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
     }
     if(realloc(requests[clientindex].request, requests[clientindex].buffersize))
         senderrorresponsetoclient(clienttodouble, NOT_ENOUGH_MEMORY);
-    
 }
 //expects client_list_start and client_list_end and lowest_open_client to all be equal to client_list[0]
 //to account for the case where lowest_open_client is equal to client_list_end because client_list_end and client_list_start are incorrect when we have 0 clients
@@ -212,7 +224,7 @@ void replaceoldestclient(SOCKET _listensock){ //only called when client list is 
     acceptclient(_listensock);
 }
 
-void deleteclientandsplicelist(struct client_list_t * clienttodelete){
+void sdeleteclientandsplicelist(struct client_list_t * clienttodelete){
     if(previous_client != clienttodelete){ //i set them equal before the loop runs through the headers
         previous_client->next = clienttodelete->next;
     }
@@ -221,7 +233,7 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
 
 enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
 #define HEADER_FIELD_FORMAT_ERROR -1
-#define MAX_DATE_LENGTH 40
+#define MAX_DATE_LENGTH INTERNET_RFC1123_BUFSIZE
 char * extractfieldfromstring(const char* str, char* const strend, void * const outvalue, const enum fieldtype_t fieldtype){
     //returns the value in outvalue if not NULL and returns a pointer to the beginning of the field including the field name, if field is not found returns NULL, if field is incorrectly formatted returns -1
     char * field;
@@ -407,7 +419,7 @@ void getbodyconnection(struct client_list_t* client, int newbytes){
     reply(client);
 }
 
-const struct http_header_data_t * loadheaderdata(struct client_list_t * client){
+int loadheaderdata(struct client_list_t * client){
     // Function returns a pointer to a static struct http_header_data_t.
     // The function first checks for the request method (POST, GET, HEAD) on the first line.
     // If a '\r' character is present, it null-terminates the first line and then resets the character after finishing parsing.
@@ -436,6 +448,7 @@ const struct http_header_data_t * loadheaderdata(struct client_list_t * client){
     // However, if the keyword appears after the first whitespace (e.g., "connection: wubrw9r8 close"), it will not match.
     static struct http_header_data_t out;
     requests[clientindex].http_header = &out;
+    memset(&out, 0, sizeof(out));
     char * lastalnum = 0;
     char * mainstringpos = requests[clientindex].request;
     char * tempend = strchr(mainstringpos, '\r');
@@ -511,8 +524,80 @@ const struct http_header_data_t * loadheaderdata(struct client_list_t * client){
     }
 }
 
-void reply(struct client_list_t* client){
+static size_t _bufremain = 0;
+char * _buffer = 0;
+void snprintfappendinit(char * buffer, size_t bufsize){
+    _bufremain = bufsize;
+    _buffer = buffer;
+    return;
+}
+int snprintfappend(char * format, ...){
+    va_list var;
+    va_start(var, format);
+    int written = vsnprintf(_buffer, _bufremain, format, var);
+    va_end(var);
+    if(written <= 0){return written;}
+    _bufremain-=written;
+    _buffer+=written;
+    return written;
+}
+size_t snprintfgetbufremain(){return _bufremain;}
+int snprintftrackexternalwrite(int numwrote){
+    _bufremain -= numwrote;
+    return _bufremain;
+}
 
+void reply(struct client_list_t* client){
+    if(loadheaderdata(client)){senderrorresponsetoclient(client, BAD_REQUEST); return;}
+    struct http_header_data_t * quick = requests[clientindex].http_header;
+    if(!quick->host[0]){senderrorresponsetoclient(client, BAD_REQUEST); return;}
+    if(!(quick->requesttype == 1 || quick->requesttype == 3)){senderrorresponsetoclient(client, NOT_IMPLIMENTED); return;}
+    FILE * manifest = fopen("manifest.txt", "r");
+    char path[MAX_PATH];
+    while(EOF != fscanf_s(manifest, "%[^\r\n] ", path, sizeof(path))){
+        if(StrStrIA(quick->path, path)) goto found;
+    }
+    senderrorresponsetoclient(client, NOT_FOUND);
+    fclose(manifest);
+    return;
+    found:
+    fclose(manifest);
+    FILE * file = fopen(path, "rb");
+    if(!file) senderrorresponsetoclient(client, NOT_FOUND);
+    #define MAX_REPLY_SIZE 100000 //MUST BE LARGER THAN 1Kb
+    char response[MAX_REPLY_SIZE];
+    fseek(file, 0, SEEK_END);
+    size_t contentlength = ftell(file) + 1;
+    rewind(file);
+
+    snprintfappendinit(response, sizeof(response));
+    snprintfappend("HTTP/1.1 200 OK\r\n");
+    snprintfappend("Content-Type: %s\r\n", getmimetypefromstringconst(path));
+    snprintfappend("Content-Length: %llu\r\n", contentlength);
+    if(quick->connection){
+        snprintfappend("Connection: keep-alive\r\n");
+    }else{
+        snprintfappend("Connection: close\r\n");
+    }
+    SYSTEMTIME timevar;
+    GetLocalTime(&timevar);
+    char datestr[MAX_DATE_LENGTH];
+    if(InternetTimeFromSystemTimeA(&timevar, INTERNET_RFC1123_FORMAT, datestr, sizeof(datestr)))
+        snprintfappend("Date: %s\r\n", datestr);
+    snprintfappend("\r\n");
+    if(quick->requesttype == 1){
+        if(snprintfgetbufremain() < contentlength){senderrorresponsetoclient(client, 0); return;}else{
+            if(contentlength!=fread(&response[MAX_REPLY_SIZE-snprintfgetbufremain()], 1, contentlength, file)) printf("\n\nwhatwhatwhat\n\n");
+            snprintftrackexternalwrite(contentlength);
+        }
+    }
+    send(client->sock, response, MAX_REPLY_SIZE-snprintfgetbufremain(), 0);
+    fclose(file);
+    if(!quick->connection){
+        deleteclientandsplicelist(client);
+    }else{
+        resetclienthttprequestbuffer(client);
+    }
 }
 
 int main(){
@@ -557,9 +642,14 @@ int main(){
         struct client_list_t * currentclient;
         previous_client = currentclient = client_list_start; //if currentclient == previous_client we know not to link back or else we create an infinite loop
         do{ //must maintain previous_client
+            continue_without_increment:
             clientindex = currentclient-client_list;
-            if((clock() - requests[clientindex].timeout) / CLOCKS_PER_SEC > 5)
+            {int64_t ticktemp = GetTickCount64();
+            if((ticktemp - requests[clientindex].timeout) > 500 && (ticktemp - requests[clientindex].timeout < UINT64_MAX - 6000000)){
                 deleteclientandsplicelist(currentclient);
+                currentclient = previous_client->next;
+                goto continue_without_increment;
+            }}
             FD_ZERO(&monoclient_set);
             FD_SET(currentclient->sock, &monoclient_set);
             struct timeval timeout = {0, 0};
