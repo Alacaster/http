@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include <setjmp.h>
 
 #define EXIT(message) do { fprintf(stderr, message); exit(1); } while(0)
 
@@ -101,11 +102,13 @@ struct client_list_t;
 struct client_list_t{
     SOCKET sock;
     struct client_list_t *next;
-}*client_list, *client_list_start, *client_list_end, *lowest_open_client, *previous_client;
+}*client_list, *client_list_start, *client_list_end, *lowest_open_client, *previous_client, *currentclient;
 FD_SET monoclient_set, listener_set, listener_set_main;
 unsigned int numberofcurrentclients;
 int clientindex; //clientindex is set by main() only
-
+void deleteclientandsplicelist(struct client_list_t * clienttodelete);
+void reply(struct client_list_t* client);
+jmp_buf buf;
 //every function must maintain lowest_open_client before they exit
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
 enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404, NOT_IMPLIMENTED = 501};
@@ -192,6 +195,7 @@ void waitforatleastoneclient(SOCKET _listensock){
     lowest_open_client->sock = accept(_listensock, (struct sockaddr *)&addresses[clientindex], &temp);
     initializehttprequestbuffer(lowest_open_client);
     lowest_open_client++;
+    numberofcurrentclients++;
 }
 //expects _listensock to be ready and non-blocking place a client at the end of the list
 void acceptclient(SOCKET _listensock){ //e
@@ -205,7 +209,7 @@ void acceptclient(SOCKET _listensock){ //e
 }
 
 void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary and set all to 0, fix lowest open address and lowest open client, do not call clearclient directly
-    if(!clienttoclear->sock || addresses[clientindex].ss_family || requests[clientindex].buffersize) EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
+    if(!clienttoclear->sock || !addresses[clientindex].ss_family || !requests[clientindex].buffersize) EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
     if(clienttoclear < lowest_open_client) lowest_open_client = clienttoclear; //min 
     closesocket(clienttoclear->sock);
     free(requests[clientindex].request); //relieve request buffer
@@ -224,17 +228,17 @@ void replaceoldestclient(SOCKET _listensock){ //only called when client list is 
     acceptclient(_listensock);
 }
 
-void sdeleteclientandsplicelist(struct client_list_t * clienttodelete){
-    if(previous_client != clienttodelete){ //i set them equal before the loop runs through the headers
-        previous_client->next = clienttodelete->next;
-    }
+void deleteclientandsplicelist(struct client_list_t * clienttodelete){
+    previous_client->next = clienttodelete->next;
+    currentclient=previous_client;
     clearclient(clienttodelete);
+    longjmp(buf, 1);
 }
 
-enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
-#define HEADER_FIELD_FORMAT_ERROR -1
+enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE_FIELD, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
+#define HEADER_FIELD_FORMAT_ERROR (const char *)-1
 #define MAX_DATE_LENGTH INTERNET_RFC1123_BUFSIZE
-char * extractfieldfromstring(const char* str, char* const strend, void * const outvalue, const enum fieldtype_t fieldtype){
+const char * extractfieldfromstring(const char str[], char* const strend, void * const outvalue, const enum fieldtype_t fieldtype){
     //returns the value in outvalue if not NULL and returns a pointer to the beginning of the field including the field name, if field is not found returns NULL, if field is incorrectly formatted returns -1
     char * field;
     switch (fieldtype) {
@@ -248,7 +252,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
         case ACCEPT_ENCODING: field = "accept-encoding:"; break;
         case CONTENT_TYPE: field = "content-type:"; break;
         case CACHE_CONTROL: field = "cache-control:"; break;
-        case DATE: field = "date:"; break;
+        case DATE_FIELD: field = "date:"; break;
         case ETAG: field = "etag:"; break;
         case EXPIRES: field = "expires:"; break;
         case LAST_MODIFIED: field = "last-modified:"; break;
@@ -257,7 +261,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
         default:
             EXIT("\nUnsupported field in extractfieldfromstring()");
     }
-    char *returnstr;
+    const char * returnstr;
     const int fieldlen = strlen(field);
     {
         char * tempstrend = strend - (fieldlen+1);
@@ -265,7 +269,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
             int a;
             for(a = 0; a < fieldlen; a++){
                 if(tolower(str[a]) != field[a]) {
-                    str+=a;
+                    str+= a > 0 ? a : 1;
                     goto continuewhile;
                 }
             }
@@ -292,7 +296,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
         case ACCEPT_ENCODING: break;
         case CONTENT_TYPE: break;
         case CACHE_CONTROL: break;
-        case DATE: returntype = TIME; break;
+        case DATE_FIELD: returntype = TIME; break;
         case ETAG: break;
         case EXPIRES: break;
         case LAST_MODIFIED: returntype = TIME; break;
@@ -303,17 +307,17 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
     }
     switch (returntype) {
         case LONG_INT: 
-            while(!isdigit(str) && str < fieldend) str++;
+            while(!isdigit(*str) && str < fieldend) str++;
             if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
             if(!outvalue) *((long int*)outvalue) = strtol(str, NULL, 10);
             break;
         case DOUBLE:
-            while(!isdigit(str) && str < fieldend) str++;
+            while(!isdigit(*str) && str < fieldend) str++;
             if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
             if(!outvalue) *((double*)outvalue) = strtod(str, NULL);
             break;
         case TIME: {
-                while(!isprint(str) && str < fieldend) str++;
+                while(!isprint(*str) && str < fieldend) str++;
                 if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
                 if(!fieldend || fieldend-str > MAX_DATE_LENGTH) return HEADER_FIELD_FORMAT_ERROR;
                 char tempdate[fieldend - str];
@@ -324,8 +328,8 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
                 break;
             }
         case STRING:
-            while(!isprint(str) && str < fieldend) str++;
-            *((char *)outvalue) = str;
+            while(!isprint(*str) && str < fieldend) str++;
+            *((const char **)outvalue) = str;
             break;
         default: break;
     }
@@ -334,7 +338,7 @@ char * extractfieldfromstring(const char* str, char* const strend, void * const 
 
 void getbodylengthtypefromheader(struct client_list_t* client){
     int length = 0;
-    char* fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, &length, CONTENT_LENGTH);
+    const char * fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, &length, CONTENT_LENGTH);
     if(fieldstart){
         if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
             senderrorresponsetoclient(client, BAD_REQUEST); 
@@ -399,7 +403,7 @@ void getbodychunked(struct client_list_t* client, int newbytes){
         if(!checkfornewline) return;
         chunklengthlinelength = (requests[clientindex].body_start+bodyindex[clientindex]) - checkfornewline;
         chunklengthlinelength+=2;
-        if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], " %x", &bytelength)) senderrorresponsetoclient(client, BAD_REQUEST);
+        if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], " %x", &bytelength)){senderrorresponsetoclient(client, BAD_REQUEST); return;}
         if(!bytelength){
             requests[clientindex].request_end = requests[clientindex].body_start + (bodyindex[clientindex] - 1);
             bodyindex[clientindex] = 0;
@@ -415,7 +419,7 @@ void getbodychunked(struct client_list_t* client, int newbytes){
 }
 void getbodyconnection(struct client_list_t* client, int newbytes){
     if(newbytes) return;
-    if(connect(client->sock, &addresses[clientindex], sizeof(SOCKADDR_STORAGE))) return;
+    if(connect(client->sock, (struct sockaddr*)&addresses[clientindex], sizeof(SOCKADDR_STORAGE))) return;
     reply(client);
 }
 
@@ -509,10 +513,10 @@ int loadheaderdata(struct client_list_t * client){
                         fieldstwings[x].string = 0;
                         break;
                     case 4:
-                        char connection[MAX_DATE_LENGTH];
-                        memset(connection, 0, sizeof(connection));
-                        if(sscanf_s(mainstringpos+1, "%40[^\t\n\v\f\r]", connection, sizeof(connection))){senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
-                        if(!InternetTimeToSystemTimeA(connection, &out.time, 0)){senderrorresponsetoclient(client, 0); return 1;}
+                        char date[MAX_DATE_LENGTH];
+                        memset(date, 0, sizeof(date));
+                        if(sscanf_s(mainstringpos+1, "%40[^\t\n\v\f\r]", date, sizeof(date))){senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
+                        if(!InternetTimeToSystemTimeA(date, &out.time, 0)){senderrorresponsetoclient(client, 0); return 1;}
                         fieldstwings[x].string = 0;
                         break;
                 }
@@ -614,17 +618,19 @@ int main(){
     requests = (struct http_request_t *)calloc(MAXCLIENTS, sizeof(struct http_request_t *));
     FD_ZERO(&listener_set_main);
     FD_SET(listensock, &listener_set_main);
-    client_list_start = client_list, client_list_end = client_list;
+    client_list_start = client_list; client_list_end = client_list;
     lowest_open_client = client_list;// when remove a client check to see if it's lower, when add a client, move up to next empty space, == maxclients means full
     numberofcurrentclients = 0;
-    void (*handlers[])(struct client_list_t*, int) = {&getheader, &getbodycontentlength, &getbodychunked, &getbodyconnection, &reply};
+    void (*handlers[])(struct client_list_t*, int) = {&getheader, &getbodycontentlength, &getbodychunked, &getbodyconnection};
     while(1){
         //check listening socket with select by copying its fdset
         //if new client available add it to the front the list and store it in lowest_open_client
         //if list is full, replace the first item on the list, set client_list_start to the next one, set the client_list_end client to point to new client and set client_list_end to point to new client
         //when removing a client due to lost connection or sent request, check if lower than lowest_open_client
         //when adding client, increment lowest_open_client to next open spot or until >= MAXCLIENTS
-        if(!numberofcurrentclients){waitforatleastoneclient(listensock);}else{
+        if(!numberofcurrentclients){
+            waitforatleastoneclient(listensock);
+        }else{
             listener_set = listener_set_main; struct timeval timeout = {0, 70000};
             select(0, &listener_set, 0, 0, &timeout);
             if(FD_ISSET(listensock, &listener_set)){
@@ -639,16 +645,13 @@ int main(){
                 }
             }
         }
-        struct client_list_t * currentclient;
         previous_client = currentclient = client_list_start; //if currentclient == previous_client we know not to link back or else we create an infinite loop
         do{ //must maintain previous_client
-            continue_without_increment:
+            if(setjmp(buf)) goto error;
             clientindex = currentclient-client_list;
             {int64_t ticktemp = GetTickCount64();
             if((ticktemp - requests[clientindex].timeout) > 500 && (ticktemp - requests[clientindex].timeout < UINT64_MAX - 6000000)){
                 deleteclientandsplicelist(currentclient);
-                currentclient = previous_client->next;
-                goto continue_without_increment;
             }}
             FD_ZERO(&monoclient_set);
             FD_SET(currentclient->sock, &monoclient_set);
@@ -663,6 +666,8 @@ int main(){
                 (*(handlers+requests[clientindex].handlerindex))(currentclient, newbytes);
             }
             previous_client = currentclient;
-        }while(currentclient = currentclient->next);//this is fine cause if we have 0 clients we just wait for accept();
+            error:
+            currentclient = currentclient->next;
+        }while(currentclient);//this is fine cause if we have 0 clients we just wait for accept();
     }
 }
