@@ -650,7 +650,7 @@ int main(){
         //when removing a client due to lost connection or sent request, check if lower than lowest_open_client
         //when adding client, increment lowest_open_client to next open spot or until >= MAXCLIENTS
         if(!numberofcurrentclients){
-            //clientindex = lowest_open_client-client_list;
+            clientindex = lowest_open_client-client_list;
             waitforatleastoneclient(listensock);
         }else{
             listener_set = listener_set_main; struct timeval timeout = {0, 70000};
