@@ -103,15 +103,15 @@ struct client_list_t{
     SOCKET sock;
     struct client_list_t *next;
 }*client_list, *client_list_start, *client_list_end, *lowest_open_client, *previous_client, *currentclient;
-FD_SET monoclient_set, listener_set, listener_set_main;
 unsigned int numberofcurrentclients;
 int clientindex; //clientindex is set by main() only
+jmp_buf buf;
 void deleteclientandsplicelist(struct client_list_t * clienttodelete);
 void reply(struct client_list_t* client);
-jmp_buf buf;
+
 //every function must maintain lowest_open_client before they exit
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
-enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404, NOT_IMPLIMENTED = 501};
+enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404, NOT_IMPLIMENTED = 501, REQUEST_TIMEOUT = 408};
 void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errortype_t error){
     FD_SET sendset;
     FD_ZERO(&sendset);
@@ -142,6 +142,9 @@ void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errort
                 status = "501 Not Implimented";
                 description = "The sever could not process your request.";
                 break;
+            case REQUEST_TIMEOUT:
+                status = "408 Request Timeout";
+                description = "Request not fully recieved before timeout.";
             default:
                 status = "500 Internal Server Error";
                 description = "An unexpected error occurred on the server.";
@@ -164,8 +167,8 @@ void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errort
 void initializehttprequestbuffer(struct client_list_t *structtoinit){
     requests[clientindex].buffersize = DEFAULTREQUESTBUFFERSIZE;
     requests[clientindex].request_end = requests[clientindex].request = (char *)calloc(requests[clientindex].buffersize, 1);
-    requests[clientindex].request_end--;
     if(!requests[clientindex].request) senderrorresponsetoclient(structtoinit, NOT_ENOUGH_MEMORY);
+    requests[clientindex].request_end--;
     requests[clientindex].timeout = GetTickCount64();
 }
 void resetclienthttprequestbuffer(struct client_list_t *structtoreset){
@@ -196,9 +199,11 @@ void waitforatleastoneclient(SOCKET _listensock){
     initializehttprequestbuffer(lowest_open_client);
     lowest_open_client++;
     numberofcurrentclients++;
+    client_list_start = client_list;
+    client_list_end = client_list;
 }
 //expects _listensock to be ready and non-blocking place a client at the end of the list
-void acceptclient(SOCKET _listensock){ //e
+void acceptclient(SOCKET _listensock){
     client_list_end->next = lowest_open_client;
     client_list_end = lowest_open_client;
     int temp = sizeof(struct sockaddr_storage);
@@ -215,22 +220,28 @@ void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary
     free(requests[clientindex].request); //relieve request buffer
     memset(&addresses[clientindex], 0, sizeof(addresses[clientindex]));
     memset(&requests[clientindex], 0, sizeof(requests[clientindex]));
-    memset(&clienttoclear, 0, sizeof(clienttoclear));
+    memset(clienttoclear, 0, sizeof(*clienttoclear));
     numberofcurrentclients--;
+    if(numberofcurrentclients < 0){EXIT("numberofcurrentclients < 0? in clearclient");}
 }
 
 void replaceoldestclient(SOCKET _listensock){ //only called when client list is full
     //set the start pointer to next client
     //clear and free the old client
-    typeof(client_list_start) client_list_start_temp = client_list_start;
+    struct client_list_t * client_list_start_temp = client_list_start;
     client_list_start = client_list_start->next;
     clearclient(client_list_start_temp);
     acceptclient(_listensock);
 }
 
 void deleteclientandsplicelist(struct client_list_t * clienttodelete){
-    previous_client->next = clienttodelete->next;
     currentclient=previous_client;
+    if(clienttodelete == client_list_end){
+        client_list_end = previous_client;
+    }else if(clienttodelete == client_list_start){
+        client_list_start = clienttodelete->next;
+    }
+    previous_client->next = clienttodelete->next;
     clearclient(clienttodelete);
     longjmp(buf, 1);
 }
@@ -607,19 +618,24 @@ void reply(struct client_list_t* client){
 int main(){
     //if a function is called with a socket, you must set clientindex to lowest open client
     //if a function is called with a client struct pointer you must set clientindex to that client
+    //if you think i'm stupid for using goto go fuck yourself
     WSADATA startup;
+    FD_SET monoclient_set, listener_set, listener_set_main;
     if(WSAStartup(MAKEWORD(2, 2), &startup)) EXIT("WSAStartup()\n");
     printwsadata(&startup);
     SOCKET listensock = create_socket(0, "80");
     printf("\nListening on: ");
     printaddressofsocket(listensock);
-    client_list = (struct client_list_t *)calloc(MAXCLIENTS+1, sizeof(struct client_list_t)); //set socket to 0 to clear, last space is always 0
+    client_list = (struct client_list_t *)calloc(MAXCLIENTS+1, sizeof(struct client_list_t)); //set socket to 0 to clear, last is always 0 so that when we search for open spot we stop there
     addresses = (struct sockaddr_storage *)calloc(MAXCLIENTS, sizeof(struct sockaddr_storage));
     requests = (struct http_request_t *)calloc(MAXCLIENTS, sizeof(struct http_request_t *));
     FD_ZERO(&listener_set_main);
     FD_SET(listensock, &listener_set_main);
-    client_list_start = client_list; client_list_end = client_list;
-    lowest_open_client = client_list;// when remove a client check to see if it's lower, when add a client, move up to next empty space, == maxclients means full
+    lowest_open_client = client_list_start = client_list_end = client_list;
+    // when remove a client check to see if it's lower than lowest_open_client, if it is client_list_start make sure to maintain client_list_start by moving it to the next one
+    // 
+    // when add a client, move up to next empty space, == maxclients means full.
+    // 
     numberofcurrentclients = 0;
     void (*handlers[])(struct client_list_t*, int) = {&getheader, &getbodycontentlength, &getbodychunked, &getbodyconnection};
     while(1){
@@ -647,10 +663,11 @@ int main(){
         }
         previous_client = currentclient = client_list_start; //if currentclient == previous_client we know not to link back or else we create an infinite loop
         do{ //must maintain previous_client
-            if(setjmp(buf)) goto error;
+            int returnval = 0;
+            if(returnval = setjmp(buf)) goto error;
             clientindex = currentclient-client_list;
             {int64_t ticktemp = GetTickCount64();
-            if((ticktemp - requests[clientindex].timeout) > 500 && (ticktemp - requests[clientindex].timeout < UINT64_MAX - 6000000)){
+            if(0/*(ticktemp - requests[clientindex].timeout) > 500 && (ticktemp - requests[clientindex].timeout < UINT64_MAX - 6000000)*/){
                 deleteclientandsplicelist(currentclient);
             }}
             FD_ZERO(&monoclient_set);
