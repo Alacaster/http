@@ -214,13 +214,16 @@ void acceptclient(SOCKET _listensock){
 }
 
 void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary and set all to 0, fix lowest open address and lowest open client, do not call clearclient directly
-    if(!clienttoclear->sock || !addresses[clientindex].ss_family || !requests[clientindex].buffersize) EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
+    if(!clienttoclear->sock || !addresses[clientindex].ss_family || !requests[clientindex].buffersize) {
+        printf("\nclienttoclear index:%lld", (ptrdiff_t)(clienttoclear-client_list));
+        EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
+    }
     if(clienttoclear < lowest_open_client) lowest_open_client = clienttoclear; //min 
     closesocket(clienttoclear->sock);
     free(requests[clientindex].request); //relieve request buffer
     memset(&addresses[clientindex], 0, sizeof(addresses[clientindex]));
     memset(&requests[clientindex], 0, sizeof(requests[clientindex]));
-    memset(clienttoclear, 0, sizeof(*clienttoclear));
+    memset(clienttoclear, 0, sizeof(struct client_list_t));
     numberofcurrentclients--;
     if(numberofcurrentclients < 0){EXIT("numberofcurrentclients < 0? in clearclient");}
 }
@@ -235,13 +238,13 @@ void replaceoldestclient(SOCKET _listensock){ //only called when client list is 
 }
 
 void deleteclientandsplicelist(struct client_list_t * clienttodelete){
-    currentclient=previous_client;
+    previous_client->next = clienttodelete->next;
     if(clienttodelete == client_list_end){
         client_list_end = previous_client;
+        //previous_client->next = NULL;
     }else if(clienttodelete == client_list_start){
         client_list_start = clienttodelete->next;
     }
-    previous_client->next = clienttodelete->next;
     clearclient(clienttodelete);
     longjmp(buf, 1);
 }
@@ -577,6 +580,7 @@ void reply(struct client_list_t* client){
     return;
     found:
     fclose(manifest);
+    memcpy(path, "path.txt", 9); //DEBUG TEST MUST DELETE
     FILE * file = fopen(path, "rb");
     if(!file) senderrorresponsetoclient(client, NOT_FOUND);
     #define MAX_REPLY_SIZE 100000 //MUST BE LARGER THAN 1Kb
@@ -621,6 +625,7 @@ int main(){
     //if you think i'm stupid for using goto go fuck yourself
     WSADATA startup;
     FD_SET monoclient_set, listener_set, listener_set_main;
+    struct client_list_t * currentclient;
     if(WSAStartup(MAKEWORD(2, 2), &startup)) EXIT("WSAStartup()\n");
     printwsadata(&startup);
     SOCKET listensock = create_socket(0, "80");
@@ -645,6 +650,7 @@ int main(){
         //when removing a client due to lost connection or sent request, check if lower than lowest_open_client
         //when adding client, increment lowest_open_client to next open spot or until >= MAXCLIENTS
         if(!numberofcurrentclients){
+            //clientindex = lowest_open_client-client_list;
             waitforatleastoneclient(listensock);
         }else{
             listener_set = listener_set_main; struct timeval timeout = {0, 70000};
@@ -664,10 +670,13 @@ int main(){
         previous_client = currentclient = client_list_start; //if currentclient == previous_client we know not to link back or else we create an infinite loop
         do{ //must maintain previous_client
             int returnval = 0;
-            if(returnval = setjmp(buf)) goto error;
+            if(returnval = setjmp(buf)) {
+                goto error;
+                currentclient=previous_client;
+            }
             clientindex = currentclient-client_list;
             {int64_t ticktemp = GetTickCount64();
-            if(0/*(ticktemp - requests[clientindex].timeout) > 500 && (ticktemp - requests[clientindex].timeout < UINT64_MAX - 6000000)*/){
+            if((ticktemp - requests[clientindex].timeout) > 500 && (ticktemp - requests[clientindex].timeout < UINT64_MAX - 6000000)){
                 deleteclientandsplicelist(currentclient);
             }}
             FD_ZERO(&monoclient_set);
