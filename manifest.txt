@@ -1,2 +1,1 @@
-szy
-what e fuck
+land.txt

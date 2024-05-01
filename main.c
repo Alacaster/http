@@ -26,6 +26,33 @@ void printwsadata(WSADATA *a){
     printf("Initialized Winsock Version %hhu.%hhu\nHighest Available: %hhu.%hhu\nDescription:\t%s\nSystem Status:\t%s", ver.bytes[0], ver.bytes[1], hiver.bytes[0], hiver.bytes[1], a->szDescription, a->szSystemStatus);
 }
 
+void print_escaped_string(const char *str, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        char c = str[i];
+        if (isprint(c)) {
+            putchar(c);
+        } else {
+            switch (c) {
+                case '\n':
+                    printf("\\n");
+                    break;
+                case '\r':
+                    printf("\\r");
+                    break;
+                case '\t':
+                    printf("\\t");
+                    break;
+                case '\0':
+                    printf("\\0");
+                    break;
+                default:
+                    printf("\\x%02X", c);
+                    break;
+            }
+        }
+    }
+}
+
 void printaddressofsocket(SOCKET b){
     SOCKADDR_STORAGE a;
     size_t balls = sizeof(a);
@@ -78,6 +105,7 @@ const char * getmimetypefromstringconst(const char * type){
 enum functionhandler {FN_GETHEADER, FN_GETBODYCONTENTLENGTH, FN_GETBODYCHUNKED, FN_GETBODYCONNECTION};
 #define MAXCLIENTS 30
 #define DEFAULTREQUESTBUFFERSIZE 0b10000000000
+#define MAX_DATE_LENGTH INTERNET_RFC1123_BUFSIZE
 struct http_header_data_t{
         char host[1024];
         char path[MAX_PATH];
@@ -109,10 +137,44 @@ jmp_buf buf;
 void deleteclientandsplicelist(struct client_list_t * clienttodelete);
 void reply(struct client_list_t* client);
 
+void printclientinformation(struct client_list_t * client){
+    int cli = client-client_list;
+    printf("\nClient %lld -> %lld sock=%d ", client-client_list, ((client->next-client_list) >= 0) ? (client->next-client_list) : -1, client->sock);printaddressofsocket(client->sock);
+    printf( "\ncontent_length: \t%d"
+            "\nhandler function index:\t%d"
+            "\nbuffersize:\t\t%ld"
+    ,requests[cli].content_length,
+    requests[cli].handlerindex,
+    requests[cli].buffersize);
+    printf("\nrequest:");
+    print_escaped_string(requests[cli].request, requests[cli].request_end-requests[cli].request+1);
+    printf("\nbody_start: %s", requests[cli].body_start ? "FOUND" : "NULL");
+    if(requests[cli].http_header){
+        char datestring[MAX_DATE_LENGTH];
+        InternetTimeFromSystemTimeA(&requests[cli].http_header->time, INTERNET_RFC1123_FORMAT, datestring, sizeof(datestring));
+        printf( "\nhost: %s"
+                "\npath: %s"
+                "\nuser-agent: %s"
+                "\ncontent-type: %s"
+                "\nconnection: %s"
+                "\nrequesttype: %hhd"
+                "\ntime: %s",
+                requests[cli].http_header->host,
+                requests[cli].http_header->path,
+                requests[cli].http_header->useragent,
+                requests[cli].http_header->contenttype,
+                requests[cli].http_header->connection ? "close" : "keep",
+                requests[cli].http_header->requesttype,
+                datestring);
+    }
+    putchar('\n');
+}
+
 //every function must maintain lowest_open_client before they exit
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
 enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404, NOT_IMPLIMENTED = 501, REQUEST_TIMEOUT = 408};
 void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errortype_t error){
+    printf("\nSending error to client:");
     FD_SET sendset;
     FD_ZERO(&sendset);
     FD_SET(clienttoclose->sock, &sendset);
@@ -158,7 +220,7 @@ void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errort
                     "\r\n"
                     "%s",
                     status, strlen(description), description);
-        printf("\nClient was cut off due to error: %s", status);
+        printf("\n%s\n", response);
         send(clienttoclose->sock, response, strlen(response), 0);
     }
     deleteclientandsplicelist(clienttoclose);
@@ -170,6 +232,17 @@ void initializehttprequestbuffer(struct client_list_t *structtoinit){
     if(!requests[clientindex].request) senderrorresponsetoclient(structtoinit, NOT_ENOUGH_MEMORY);
     requests[clientindex].request_end--;
     requests[clientindex].timeout = GetTickCount64();
+    printclientinformation(structtoinit);
+    /*printf( "\nInitialized slot %lld:\n"
+            "buffersize =\t%ld\n"
+            "request =\t%p\n"
+            "request_end =\t%p\n"
+            "timeout =\t%llu\n\n",
+       (ptrdiff_t)(structtoinit-client_list),
+       requests[clientindex].buffersize,
+       requests[clientindex].request,
+       requests[clientindex].request_end,
+       requests[clientindex].timeout);*/
 }
 void resetclienthttprequestbuffer(struct client_list_t *structtoreset){
     requests[clientindex].buffersize = DEFAULTREQUESTBUFFERSIZE;
@@ -179,7 +252,10 @@ void resetclienthttprequestbuffer(struct client_list_t *structtoreset){
     requests[clientindex].handlerindex = 0;
     requests[clientindex].body_start = 0;
     requests[clientindex].timeout = GetTickCount64() + 300000;
-    requests[clientindex].http_header = 0;
+    if(requests[clientindex].http_header){
+        memset(requests[clientindex].http_header, 0, sizeof(struct http_header_data_t));
+        requests[clientindex].http_header = NULL;
+    }
 }
 
 void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
@@ -193,37 +269,54 @@ void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
 //expects client_list_start and client_list_end and lowest_open_client to all be equal to client_list[0]
 //to account for the case where lowest_open_client is equal to client_list_end because client_list_end and client_list_start are incorrect when we have 0 clients
 void waitforatleastoneclient(SOCKET _listensock){
+    printf("\n\n~~~~~~~Waiting for any connection...");
     if(lowest_open_client != client_list) EXIT("\nlowest_open_client != client_list   This should never happen");
     int temp = sizeof(struct sockaddr_storage);
     lowest_open_client->sock = accept(_listensock, (struct sockaddr *)&addresses[clientindex], &temp);
+    printf(" connection found on socket:%d ", client_list->sock);printaddressofsocket(client_list->sock);
     initializehttprequestbuffer(lowest_open_client);
     lowest_open_client++;
+    printf("\nlowest_open_client %d -> %d", (lowest_open_client-client_list)-1, lowest_open_client-client_list);
+    printf("\nnumberofcurrentclients: %d -> %d", numberofcurrentclients, numberofcurrentclients+1);
     numberofcurrentclients++;
     client_list_start = client_list;
     client_list_end = client_list;
 }
 //expects _listensock to be ready and non-blocking place a client at the end of the list
 void acceptclient(SOCKET _listensock){
+    printf("\n\n~~~~~~~~Accepting new client. Loading into slot %lld\nSlot %lld now points to %lld", (ptrdiff_t)(lowest_open_client-client_list),(ptrdiff_t)(client_list_end-client_list),(ptrdiff_t)(lowest_open_client-client_list));
     client_list_end->next = lowest_open_client;
     client_list_end = lowest_open_client;
     int temp = sizeof(struct sockaddr_storage);
     lowest_open_client->sock = accept(_listensock, (struct sockaddr *)&addresses[clientindex], &temp);
     initializehttprequestbuffer(lowest_open_client);
-    while((lowest_open_client++)->sock); //find empty client, the end must always be empty
+    printf("\nlowest_open_client %d -> ", lowest_open_client-client_list);
+    while((lowest_open_client)->sock) lowest_open_client++; //find empty client, the end must always be empty
+    printf("%d", lowest_open_client-client_list);
+    printf("\nnumberofcurrentclients: %d -> %d", numberofcurrentclients, numberofcurrentclients+1);
     numberofcurrentclients++;
 }
 
 void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary and set all to 0, fix lowest open address and lowest open client, do not call clearclient directly
+    printf("\n\n~~~Clearing cient\n"); printclientinformation(clienttoclear);
     if(!clienttoclear->sock || !addresses[clientindex].ss_family || !requests[clientindex].buffersize) {
         printf("\nclienttoclear index:%lld", (ptrdiff_t)(clienttoclear-client_list));
         EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
     }
-    if(clienttoclear < lowest_open_client) lowest_open_client = clienttoclear; //min 
+    if(clienttoclear < lowest_open_client){
+        printf("\nlowest_open_client %d ->", lowest_open_client-client_list);
+        lowest_open_client = clienttoclear;
+        printf("%d", lowest_open_client-client_list);
+    }//min 
     closesocket(clienttoclear->sock);
     free(requests[clientindex].request); //relieve request buffer
     memset(&addresses[clientindex], 0, sizeof(addresses[clientindex]));
     memset(&requests[clientindex], 0, sizeof(requests[clientindex]));
     memset(clienttoclear, 0, sizeof(struct client_list_t));
+    if(requests[clientindex].http_header){
+        memset(requests[clientindex].http_header, 0, sizeof(struct http_header_data_t));
+    }
+    printf("numberofcurrentclients: %d -> %d", numberofcurrentclients, numberofcurrentclients-1);
     numberofcurrentclients--;
     if(numberofcurrentclients < 0){EXIT("numberofcurrentclients < 0? in clearclient");}
 }
@@ -241,7 +334,6 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
     previous_client->next = clienttodelete->next;
     if(clienttodelete == client_list_end){
         client_list_end = previous_client;
-        //previous_client->next = NULL;
     }else if(clienttodelete == client_list_start){
         client_list_start = clienttodelete->next;
     }
@@ -251,7 +343,6 @@ void deleteclientandsplicelist(struct client_list_t * clienttodelete){
 
 enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE_FIELD, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
 #define HEADER_FIELD_FORMAT_ERROR (const char *)-1
-#define MAX_DATE_LENGTH INTERNET_RFC1123_BUFSIZE
 const char * extractfieldfromstring(const char str[], char* const strend, void * const outvalue, const enum fieldtype_t fieldtype){
     //returns the value in outvalue if not NULL and returns a pointer to the beginning of the field including the field name, if field is not found returns NULL, if field is incorrectly formatted returns -1
     char * field;
@@ -464,6 +555,12 @@ int loadheaderdata(struct client_list_t * client){
     // The function then checks if "close" or "keep-alive" is present in the string. It will match even if the keyword
     // is surrounded by other characters (e.g., "iwe7rbweclosecibueipuw" or "close 2938nefnei"), which is intended.
     // However, if the keyword appears after the first whitespace (e.g., "connection: wubrw9r8 close"), it will not match.
+
+    //variable out needs to 0'd when a client that is pointing to it is no longer pointing to it
+    //the only time this happens is when a client is cleared or reset so it's handled in those two functions that do that
+    //if an error response is sent to a client it also clears the client
+    //the functions that clear or reset a client only clear struct "out" when the client they are clearing point to something
+    //they memset at that location
     static struct http_header_data_t out;
     requests[clientindex].http_header = &out;
     memset(&out, 0, sizeof(out));
