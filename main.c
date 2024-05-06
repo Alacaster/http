@@ -491,6 +491,10 @@ void choosehandler(struct client_list_t* client){
     }
     requests[clientindex].timeout+=10000+ACCEPTABLE_REPLY_LOAD; //10 seconds to recieve reply
     requests[clientindex].handlerindex = FN_GRACIOUSREPLY;
+    if (ioctlsocket(sock, FIONBIO, &iMode) != 0) {
+        printf("/nFailed to set socket to non-blocking mode.");
+        deleteclientandsplicelist(client);
+    }
 }
 
 void getheader(struct client_list_t* client, int newbytes){//find when the header is complete
@@ -555,19 +559,8 @@ void getbodychunked(struct client_list_t* client, int newbytes){
         bodyindex[clientindex] += bytelength;
     }
 }
-void getbodyconnection(struct client_list_t* client, int newbytes){
-    if(newbytes){
-        printf("\nRecieved zero bytes");
-        return;
-    }
-    reply(client);
-}
 
 void graciousreply(struct client_list_t* client, int newbytes){ //for POST requests, if not transfer-encoding chunked and if content-length is missing, process the request anyway after some time.
-    if(newbytes){
-        printf("\nRecieved zero bytes");
-        return;
-    }
     if(requests[clientindex].timeout-ACCEPTABLE_REPLY_LOAD < GetTickCount64()) reply(client);
 }
 
