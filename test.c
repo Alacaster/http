@@ -1,9 +1,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <shlwapi.h>
 
 int main() {
-    char field[] = "connection:";
+    char field[] = "connec";
     int fieldlen = strlen(field);
     FILE * file = fopen("output.txt", "r");
     fseek(file, 0, SEEK_END);
@@ -15,6 +16,9 @@ int main() {
     fread(str, 1, buflen, file);
     char * strend = str + buflen;
     printf("%.*s", buflen, filestr);
+    returnstr = StrStrIA(str, field);
+    str = returnstr + strlen(field);
+    /*
     {
         char * tempstrend = strend - (fieldlen+1);
         while(str < tempstrend){
@@ -37,6 +41,6 @@ int main() {
             printf("\nNot Found");
             return 0;
         }
-    }
-    printf("\n\nFound %s\n\n%.40s", field, (returnstr - 10 < filestr) ? filestr : returnstr - 10);
+    }*/
+    printf("\n\nFound %s\n\n%.40s\n\n%.40s", field, (returnstr - 10 < filestr) ? filestr : returnstr - 10, str);
 }

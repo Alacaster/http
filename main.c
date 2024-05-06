@@ -102,10 +102,11 @@ const char * getmimetypefromstringconst(const char * type){
     return "application/octet-stream";
 }
 
-enum functionhandler {FN_GETHEADER, FN_GETBODYCONTENTLENGTH, FN_GETBODYCHUNKED, FN_GETBODYCONNECTION};
+enum functionhandler {FN_GETHEADER, FN_GETBODYCONTENTLENGTH, FN_GETBODYCHUNKED, FN_GRACIOUSREPLY};
 #define MAXCLIENTS 30
 #define DEFAULTREQUESTBUFFERSIZE 0b10000000000
 #define MAX_DATE_LENGTH INTERNET_RFC1123_BUFSIZE
+#define ACCEPTABLE_REPLY_LOAD 40000
 struct http_header_data_t{
         char host[1024];
         char path[MAX_PATH];
@@ -352,6 +353,7 @@ enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGEN
 const char * extractfieldfromstring(const char str[], char* const strend, void * const outvalue, const enum fieldtype_t fieldtype){
     //returns the value in outvalue if not NULL and returns a pointer to the beginning of the field including the field name, if field is not found returns NULL, if field is incorrectly formatted returns -1
     //strend will point at the position after the last valid character
+    const char * strstart = str;
     char * field;
     switch (fieldtype) {
         case CONTENT_LENGTH: field = "content-length:"; break;
@@ -374,29 +376,13 @@ const char * extractfieldfromstring(const char str[], char* const strend, void *
             EXIT("\nUnsupported field in extractfieldfromstring()");
     }
     printf("\nLooking for field %s", field);
-    const char * returnstr;
-    const int fieldlen = strlen(field);
-    {//TODO test this
-        char * tempstrend = strend - (fieldlen+1);
-        while(str < tempstrend){
-            int a;
-            for(a = 0; a < fieldlen; a++){
-                if(tolower(str[a]) != field[a]) {
-                    str+= a > 0 ? a : 1;
-                    goto continuewhile;
-                }
-            }
-            returnstr = str;
-            str += a;
-            break;
-            continuewhile:
-        }
-        if(str == tempstrend){
-            return NULL;
-        }
-    }
+    const char * returnstr = StrStrIA(str, field);
+    if(returnstr == NULL) return returnstr;
+
+    str = returnstr + strlen(field);
     char *fieldend = strstr(str, "\r");
     if(!fieldend) return HEADER_FIELD_FORMAT_ERROR;
+    printf("\n\nFound %s\n\n%.40s\n\n%.40s", field, (returnstr - 10 < strstart) ? strstart : returnstr - 10, str);
     enum returntype_t {LONG_INT, DOUBLE, TIME, STRING} returntype = STRING;
     switch (fieldtype) {
         case CONTENT_LENGTH: returntype = LONG_INT; break;
@@ -419,42 +405,67 @@ const char * extractfieldfromstring(const char str[], char* const strend, void *
             EXIT("\nUnsupported field in extractfieldfromstring()");
     }
     switch (returntype) {
-        case LONG_INT: 
+        case LONG_INT:
+            printf("\nlooking for digit");
             while(!isdigit(*str) && str < fieldend) str++;
-            if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
-            if(!outvalue) *((long int*)outvalue) = strtol(str, NULL, 10);
+            if(fieldend == str) {printf("/n no digit found"); return HEADER_FIELD_FORMAT_ERROR;}
+            if(outvalue) {
+                *((long int*)outvalue) = strtol(str, NULL, 10);
+                printf("\nFound: %d", *((long int*)outvalue));}else {printf("\npointer wall null so no value was written");}
             break;
         case DOUBLE:
             while(!isdigit(*str) && str < fieldend) str++;
             if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
-            if(!outvalue) *((double*)outvalue) = strtod(str, NULL);
+            if(outvalue) {
+                *((double*)outvalue) = strtod(str, NULL);
+                printf("\nFound: %lf", *((double*)outvalue));}else {printf("\npointer wall null so no value was written");}
             break;
         case TIME: {
                 while(!isprint(*str) && str < fieldend) str++;
-                if(fieldend == str) return HEADER_FIELD_FORMAT_ERROR;
-                if(!fieldend || fieldend-str > MAX_DATE_LENGTH) return HEADER_FIELD_FORMAT_ERROR;
-                char tempdate[fieldend - str];
+                char tempdate[MAX_DATE_LENGTH+1];
                 strncpy(tempdate, str, sizeof(tempdate));
                 tempdate[sizeof(tempdate)-1] = '\0';
-                if(!outvalue && !InternetTimeToSystemTime(tempdate,(SYSTEMTIME*)outvalue, 0))
-                    return HEADER_FIELD_FORMAT_ERROR;
+                if(outvalue){
+                    if(!InternetTimeToSystemTime(tempdate,(SYSTEMTIME*)outvalue, 0)){
+                        printf("\nInternetTimeToSystemTime failed to get valid date");
+                        return HEADER_FIELD_FORMAT_ERROR;
+                    }
+                }else{
+                    printf("\npointer wall null so no value was written");
+                }
                 break;
             }
         case STRING:
             while(!isprint(*str) && str < fieldend) str++;
-            *((const char **)outvalue) = str;
+            if(outvalue) *((const char **)outvalue) = str;
             break;
         default: break;
     }
     return returnstr;
 }
 
-void getbodylengthtypefromheader(struct client_list_t* client){
+void choosehandler(struct client_list_t* client){
+    {
+        char tempchar = requests[clientindex].request[4];
+        requests[clientindex].request[4] = 0;
+        char * gettrue = (char *)((long long)StrStrA(requests[clientindex].request, "GET") | (long long)StrStrA(requests[clientindex].request, "HEAD"));
+        if(gettrue){
+            printf("\nprocessing a %s request", gettrue);
+            requests[clientindex].request[4] = tempchar;
+            reply(client);
+            return;
+        }else if(!StrStrA(requests[clientindex].request, "POST")){
+            senderrorresponsetoclient(client, BAD_REQUEST);
+        }
+        printf("\nprocessing a POST request");
+        requests[clientindex].request[4] = tempchar;
+    }
     int length = 0;
     const char * fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, &length, CONTENT_LENGTH);
     if(fieldstart){
         if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
-            senderrorresponsetoclient(client, BAD_REQUEST); 
+            printf("\nContent-Length: found but not properly formatted");
+            senderrorresponsetoclient(client, BAD_REQUEST);
             return;
         }else{
             requests[clientindex].content_length = length;
@@ -466,6 +477,7 @@ void getbodylengthtypefromheader(struct client_list_t* client){
     fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, transferencoding, TRANSFER_ENCODING);
     if(fieldstart){
         if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
+            printf("\nTransfer-Encoding: found but not properly formatted");
             senderrorresponsetoclient(client, BAD_REQUEST);
             return;
         }else{
@@ -477,11 +489,13 @@ void getbodylengthtypefromheader(struct client_list_t* client){
             return;
         }
     }
-    requests[clientindex].handlerindex = FN_GETBODYCONNECTION;
+    requests[clientindex].timeout+=10000+ACCEPTABLE_REPLY_LOAD; //10 seconds to recieve reply
+    requests[clientindex].handlerindex = FN_GRACIOUSREPLY;
 }
 
 void getheader(struct client_list_t* client, int newbytes){//find when the header is complete
     if(!newbytes){
+        printf("\nRecieved zero bytes");
         senderrorresponsetoclient(client, BAD_REQUEST);
         return;
     }
@@ -490,11 +504,12 @@ void getheader(struct client_list_t* client, int newbytes){//find when the heade
     char * bodystart = strstr(startscan, "\r\n\r\n");
     if(!bodystart) return;
     requests[clientindex].body_start = bodystart+4;
-    getbodylengthtypefromheader(client);
+    choosehandler(client);
 }
 
 void getbodycontentlength(struct client_list_t* client, int newbytes){
     if(!newbytes){
+        printf("\nRecieved zero bytes");
         senderrorresponsetoclient(client, BAD_REQUEST);
         return;
     }
@@ -503,37 +518,57 @@ void getbodycontentlength(struct client_list_t* client, int newbytes){
     }
     reply(client);
 }
+
 void getbodychunked(struct client_list_t* client, int newbytes){
+    static int bodyindex[MAXCLIENTS] = {0}; //points to the place where the next chunked length should be as added to body_start
     if(!newbytes){
+        printf("\nRecieved zero bytes");
+        bodyindex[clientindex] = 0;
         senderrorresponsetoclient(client, BAD_REQUEST);
         return;
     }
-    static int bodyindex[MAXCLIENTS] = {0}; //points to the place where the next chunked length should be as added to body_start
-    int bytelength;
-    while(requests[clientindex].body_start + bodyindex[clientindex] <= requests[clientindex].request_end){
-        int chunklengthlinelength; //perhaps there is no newline after a 0 chunk?
-        char * checkfornewline = strstr(requests[clientindex].body_start + bodyindex[clientindex], "\r\n");
-        if(!checkfornewline) return;
-        chunklengthlinelength = (requests[clientindex].body_start+bodyindex[clientindex]) - checkfornewline;
+    int bytelength;//length specified in the chunk processes in the while loop
+    while(requests[clientindex].body_start + bodyindex[clientindex] <= requests[clientindex].request_end){ //while where the next chunk length in hex should be is within the bounds of the request recieved so far which is maintained by main
+        char * chunklengthlinestart = requests[clientindex].body_start + bodyindex[clientindex];
+        int chunklengthlinelength;
+        char * checkfornewline = strstr(chunklengthlinestart, "\r\n");//request is always null terminated, we could rewrite this function to just use sscanf directly at the location and not check the while loop
+        if(!checkfornewline){printf("\nLine that should contain hexidecimal representation of next chunk was not terminated by CRLF, assuming the request is incomplete."); return;}
+        chunklengthlinelength = checkfornewline-chunklengthlinestart;
         chunklengthlinelength+=2;
-        if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], " %x", &bytelength)){senderrorresponsetoclient(client, BAD_REQUEST); return;}
+        {
+            char tempbyte = chunklengthlinestart[chunklengthlinelength];
+            chunklengthlinestart[chunklengthlinelength] = 0;
+            if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], "%x", &bytelength)){printf("\nsscanf() did not find valid hexidecimal number."); senderrorresponsetoclient(client, BAD_REQUEST); return;}
+            chunklengthlinestart[chunklengthlinelength] = tempbyte;
+        }
         if(!bytelength){
+            //cut off the last line which contains "0\r\n"
             requests[clientindex].request_end = requests[clientindex].body_start + (bodyindex[clientindex] - 1);
+            *(requests[clientindex].request_end-1) = 0;
             bodyindex[clientindex] = 0;
             reply(client);
         }
         bytelength+=2;
-        for(int i = bodyindex[clientindex]; (i + chunklengthlinelength) + requests[clientindex].body_start <= requests[clientindex].request_end; i++){
-            requests[clientindex].body_start[i] = requests[clientindex].body_start[i+chunklengthlinelength];
-        }
+        //THIS CODE SHOULD BE TESTED ---->
+        memmove(chunklengthlinestart, chunklengthlinestart + chunklengthlinelength, bytelength);
         requests[clientindex].request_end -= chunklengthlinelength;
         bodyindex[clientindex] += bytelength;
     }
 }
 void getbodyconnection(struct client_list_t* client, int newbytes){
-    if(newbytes) return;
-    if(connect(client->sock, (struct sockaddr*)&addresses[clientindex], sizeof(SOCKADDR_STORAGE))) return;
+    if(newbytes){
+        printf("\nRecieved zero bytes");
+        return;
+    }
     reply(client);
+}
+
+void graciousreply(struct client_list_t* client, int newbytes){ //for POST requests, if not transfer-encoding chunked and if content-length is missing, process the request anyway after some time.
+    if(newbytes){
+        printf("\nRecieved zero bytes");
+        return;
+    }
+    if(requests[clientindex].timeout-ACCEPTABLE_REPLY_LOAD < GetTickCount64()) reply(client);
 }
 
 int loadheaderdata(struct client_list_t * client){
@@ -671,6 +706,7 @@ int snprintftrackexternalwrite(int numwrote){
 }
 
 void reply(struct client_list_t* client){
+    //if cumulitive replies take more than ACCEPTABLE_REPLY_LOAD milliseconds clients that are handled by graciousreply() are vulnerable to being dropped
     if(loadheaderdata(client)){senderrorresponsetoclient(client, BAD_REQUEST); return;}
     struct http_header_data_t * quick = requests[clientindex].http_header;
     if(!quick->host[0]){senderrorresponsetoclient(client, BAD_REQUEST); return;}
@@ -747,7 +783,7 @@ int main(){
     // when add a client, move up to next empty space, == maxclients means full.
     // 
     numberofcurrentclients = 0;
-    void (*handlers[])(struct client_list_t*, int) = {&getheader, &getbodycontentlength, &getbodychunked, &getbodyconnection};
+    void (*handlers[])(struct client_list_t*, int) = {&getheader, &getbodycontentlength, &getbodychunked, &graciousreply};
     while(1){
         //check listening socket with select by copying its fdset
         //if new client available add it to the front the list and store it in lowest_open_client
