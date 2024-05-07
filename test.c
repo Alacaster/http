@@ -5,13 +5,10 @@
 #include <ws2tcpip.h>
 
 int main() {
-    WSADATA data;
-    WSAStartup(MAKEWORD(2,2), &data);
-    struct addrinfo hints, *addr;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_flags = AI_PASSIVE;
-    hints.ai_protocol = IPPROTO_TCP;
-    printf("%d", getaddrinfo(0, "80", &hints, &addr));
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    char filebuf[80000];
+    FILE * file = fopen("output.txt", "rb");
+    long size = fseek(file, 0, SEEK_END), ftell(file);
+    fseek(file, 0, SEEK_SET);
+    fread(filebuf, 1, size, file);
+    
 }

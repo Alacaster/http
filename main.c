@@ -155,7 +155,10 @@ void printclientinformation(struct client_list_t * client){
     print_escaped_string(requests[cli].request, requests[cli].request_end-requests[cli].request+1);
     printf("\nbody_start: %s", requests[cli].body_start ? "FOUND" : "NULL");
     if(requests[cli].http_header){
-        char datestring[MAX_DATE_LENGTH];
+        char _datestring[MAX_DATE_LENGTH];
+        char * datestring = requests[cli].http_header->time.wYear 
+                            ? InternetTimeFromSystemTimeA(&requests[cli].http_header->time, INTERNET_RFC1123_FORMAT, datestring, sizeof(datestring)), _datestring
+                            : "NULL";
         InternetTimeFromSystemTimeA(&requests[cli].http_header->time, INTERNET_RFC1123_FORMAT, datestring, sizeof(datestring));
         printf( "\nhost: %s"
                 "\npath: %s"
@@ -600,6 +603,7 @@ void loadheaderdata(struct client_list_t * client){
     //if an error response is sent to a client it also clears the client
     //the functions that clear or reset a client only clear struct "out" when the client they are clearing point to something
     //they memset at that location
+    printf("\nProcessing header");
     static struct http_header_data_t out;
     requests[clientindex].http_header = &out;
     memset(&out, 0, sizeof(out));
@@ -617,59 +621,51 @@ void loadheaderdata(struct client_list_t * client){
         //path and request type complete
     mainstringpos = requests[clientindex].request;
     struct string_t {const char * string; int len;} fieldstwings[] = {
-        {"host:", 6},
-        {"user-agent:", 12}, 
-        {"content-type:", 14},
-        {"connection:", 12},
-        {"date:", 6}};
-    char * lastvalidchar = 0;
+        {"host:", 5},
+        {"user-agent:", 11}, 
+        {"content-type:", 13},
+        {"connection:", 11},
+        {"date:", 5}};
     while(mainstringpos < requests[clientindex].body_start - 4){
-        if(!lastvalidchar && (isalnum(*mainstringpos) || *mainstringpos == '-' || *mainstringpos == ':')){
-            lastvalidchar = mainstringpos;
-        }else if(lastvalidchar && !(isalnum(*mainstringpos) || *mainstringpos == '-' || *mainstringpos == ':')){
-            lastvalidchar = 0; 
-        }
         if(*mainstringpos == ':'){
             for(int x = 0; x < sizeof(fieldstwings)/sizeof(struct string_t); x++){
-                if(fieldstwings[x].string && mainstringpos-fieldstwings[x].len+2 >= requests[clientindex].request){
-                    if(strnicmp(fieldstwings[x].string, mainstringpos-fieldstwings[x].len+2, fieldstwings[x].len-1)){
-                        continue;
-                    }
+                if( fieldstwings[x].string && 
+                    mainstringpos-fieldstwings[x].len+1 >= requests[clientindex].request && 
+                    !strnicmp(fieldstwings[x].string, mainstringpos-fieldstwings[x].len+1, fieldstwings[x].len)){
+                        struct string_t type;
+                        switch(x){
+                            case 0:
+                                type.string = out.host; type.len = sizeof(out.host);
+                                goto getstring;
+                            case 1:
+                                type.string = out.useragent; type.len = sizeof(out.useragent);
+                                goto getstring;
+                            case 2:
+                                type.string = out.contenttype; type.len = sizeof(out.contenttype);
+                                getstring:
+                                fieldstwings[x].string = 0;
+                                if(sscanf_s(mainstringpos+1, "%s", type.string, type.len) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, TOO_LONG);}
+                                break;
+                            case 3:
+                                char connection[100];
+                                memset(connection, 0, sizeof(connection));
+                                if(sscanf_s(mainstringpos+1, "%s", connection, sizeof(connection)) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, BAD_REQUEST);}
+                                strlwr(connection);
+                                if(strstr(connection, "close")){out.connection = 0;}else
+                                if(strstr(connection, "keep-alive")){out.connection = 1;}else{
+                                    senderrorresponsetoclient(client, BAD_REQUEST);
+                                }
+                                fieldstwings[x].string = 0;
+                                break;
+                            case 4:
+                                char date[MAX_DATE_LENGTH];
+                                memset(date, 0, sizeof(date));
+                                if(sscanf_s(mainstringpos+1, "%40[^\t\n\v\f\r]", date, sizeof(date)) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, BAD_REQUEST);}
+                                if(!InternetTimeToSystemTimeA(date, &out.time, 0)){senderrorresponsetoclient(client, 0);}
+                                fieldstwings[x].string = 0;
+                                break;
+                            }
                 }
-                struct string_t type;
-                switch(x){
-                    case 0:
-                        type.string = out.host; type.len = sizeof(out.host);
-                        goto getstring;
-                    case 1:
-                        type.string = out.useragent; type.len = sizeof(out.useragent);
-                        goto getstring;
-                    case 2:
-                        type.string = out.contenttype; type.len = sizeof(out.contenttype);
-                        getstring:
-                        fieldstwings[x].string = 0;
-                        if(sscanf_s(mainstringpos+1, "%s", type.string, type.len) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, TOO_LONG);}
-                        break;
-                    case 3:
-                        char connection[100];
-                        memset(connection, 0, sizeof(connection));
-                        if(sscanf_s(mainstringpos+1, "%s", connection, sizeof(connection)) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, BAD_REQUEST);}
-                        strlwr(connection);
-                        if(strstr(connection, "close")){out.connection = 0;}else
-                        if(strstr(connection, "keep-alive")){out.connection = 1;}else{
-                            senderrorresponsetoclient(client, BAD_REQUEST);
-                        }
-                        fieldstwings[x].string = 0;
-                        break;
-                    case 4:
-                        char date[MAX_DATE_LENGTH];
-                        memset(date, 0, sizeof(date));
-                        if(sscanf_s(mainstringpos+1, "%40[^\t\n\v\f\r]", date, sizeof(date)) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, BAD_REQUEST);}
-                        if(!InternetTimeToSystemTimeA(date, &out.time, 0)){senderrorresponsegit toclient(client, 0);}
-                        fieldstwings[x].string = 0;
-                        break;
-                }
-                break;
             }
         }
         mainstringpos++;
