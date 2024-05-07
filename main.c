@@ -16,6 +16,8 @@
 #include <stdint.h>
 #include <setjmp.h>
 
+#define blob printf(" _%d ", __LINE__);
+
 #define EXIT(message) do { fprintf(stderr, message); exit(1); } while(0)
 
 void printwsadata(WSADATA *a){
@@ -166,7 +168,7 @@ void printclientinformation(struct client_list_t * client){
                 requests[cli].http_header->path,
                 requests[cli].http_header->useragent,
                 requests[cli].http_header->contenttype,
-                requests[cli].http_header->connection ? "close" : "keep",
+                requests[cli].http_header->connection ? "keep-alive" : "close",
                 requests[cli].http_header->requesttype,
                 datestring);
     }
@@ -491,8 +493,9 @@ void choosehandler(struct client_list_t* client){
     }
     requests[clientindex].timeout+=10000+ACCEPTABLE_REPLY_LOAD; //10 seconds to recieve reply
     requests[clientindex].handlerindex = FN_GRACIOUSREPLY;
-    if (ioctlsocket(sock, FIONBIO, &iMode) != 0) {
-        printf("/nFailed to set socket to non-blocking mode.");
+    unsigned long param = 1;
+    if (ioctlsocket(client->sock, FIONBIO, &param)) {
+        printf("\nFailed to set socket to non-blocking mode.");
         deleteclientandsplicelist(client);
     }
 }
@@ -564,7 +567,7 @@ void graciousreply(struct client_list_t* client, int newbytes){ //for POST reque
     if(requests[clientindex].timeout-ACCEPTABLE_REPLY_LOAD < GetTickCount64()) reply(client);
 }
 
-int loadheaderdata(struct client_list_t * client){
+void loadheaderdata(struct client_list_t * client){
     // Function returns a pointer to a static struct http_header_data_t.
     // The function first checks for the request method (POST, GET, HEAD) on the first line.
     // If a '\r' character is present, it null-terminates the first line and then resets the character after finishing parsing.
@@ -606,11 +609,11 @@ int loadheaderdata(struct client_list_t * client){
     if(tempend) *tempend = '\0';
     if(strstr(mainstringpos, "GET")){out.requesttype = 1;
     }else if(strstr(mainstringpos, "POST")){out.requesttype = 2;
-    }else if(strstr(mainstringpos, "HEAD")){out.requesttype = 3;}else{senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
+    }else if(strstr(mainstringpos, "HEAD")){out.requesttype = 3;}else{senderrorresponsetoclient(client, BAD_REQUEST);}
     char *pathtemp = strchr(mainstringpos, '/');
-    if(!pathtemp){return 1;}
-    if(sscanf_s(pathtemp, "%s", out.path, sizeof(out.path))){senderrorresponsetoclient(client, TOO_LONG); return 1;}
-    if(tempend) *tempend = '\0';
+    if(!pathtemp) senderrorresponsetoclient(client, BAD_REQUEST);
+    if(EOF == sscanf_s(pathtemp, "%s", out.path, sizeof(out.path))){printf("\nsscanf_s returned EOF while scaning path");senderrorresponsetoclient(client, TOO_LONG);}
+    if(tempend) *tempend = '\r';
         //path and request type complete
     mainstringpos = requests[clientindex].request;
     struct string_t {const char * string; int len;} fieldstwings[] = {
@@ -628,10 +631,9 @@ int loadheaderdata(struct client_list_t * client){
         }
         if(*mainstringpos == ':'){
             for(int x = 0; x < sizeof(fieldstwings)/sizeof(struct string_t); x++){
-                if(fieldstwings[x].string){
-                for(int i = 0; mainstringpos-i > lastvalidchar && i < fieldstwings[x].len; i++){
-                    if(tolower(*(mainstringpos-i)) != *(fieldstwings[x].string-i)){
-                        goto nomatch;
+                if(fieldstwings[x].string && mainstringpos-fieldstwings[x].len+2 >= requests[clientindex].request){
+                    if(strnicmp(fieldstwings[x].string, mainstringpos-fieldstwings[x].len+2, fieldstwings[x].len-1)){
+                        continue;
                     }
                 }
                 struct string_t type;
@@ -646,12 +648,12 @@ int loadheaderdata(struct client_list_t * client){
                         type.string = out.contenttype; type.len = sizeof(out.contenttype);
                         getstring:
                         fieldstwings[x].string = 0;
-                        if(sscanf_s(mainstringpos+1, "%s", type.string, type.len) == EOF){senderrorresponsetoclient(client, TOO_LONG); return 1;}
+                        if(sscanf_s(mainstringpos+1, "%s", type.string, type.len) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, TOO_LONG);}
                         break;
                     case 3:
                         char connection[100];
                         memset(connection, 0, sizeof(connection));
-                        if(sscanf_s(mainstringpos+1, "%s", connection, sizeof(connection))){senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
+                        if(sscanf_s(mainstringpos+1, "%s", connection, sizeof(connection)) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, BAD_REQUEST);}
                         strlwr(connection);
                         if(strstr(connection, "close")){out.connection = 0;}else
                         if(strstr(connection, "keep-alive")){out.connection = 1;}else{
@@ -662,16 +664,15 @@ int loadheaderdata(struct client_list_t * client){
                     case 4:
                         char date[MAX_DATE_LENGTH];
                         memset(date, 0, sizeof(date));
-                        if(sscanf_s(mainstringpos+1, "%40[^\t\n\v\f\r]", date, sizeof(date))){senderrorresponsetoclient(client, BAD_REQUEST); return 1;}
-                        if(!InternetTimeToSystemTimeA(date, &out.time, 0)){senderrorresponsetoclient(client, 0); return 1;}
+                        if(sscanf_s(mainstringpos+1, "%40[^\t\n\v\f\r]", date, sizeof(date)) == EOF){printf("\nsscanf_s returned EOF while scaning for %s which is %d bytes", type.string, type.len);senderrorresponsetoclient(client, BAD_REQUEST);}
+                        if(!InternetTimeToSystemTimeA(date, &out.time, 0)){senderrorresponsegit toclient(client, 0);}
                         fieldstwings[x].string = 0;
                         break;
                 }
                 break;
-                }
-                nomatch:
             }
         }
+        mainstringpos++;
     }
 }
 
@@ -700,27 +701,30 @@ int snprintftrackexternalwrite(int numwrote){
 
 void reply(struct client_list_t* client){
     //if cumulitive replies take more than ACCEPTABLE_REPLY_LOAD milliseconds clients that are handled by graciousreply() are vulnerable to being dropped
-    if(loadheaderdata(client)){senderrorresponsetoclient(client, BAD_REQUEST); return;}
+    printf("\n\n~~~~~~~~Replying to client");
+    loadheaderdata(client);
     struct http_header_data_t * quick = requests[clientindex].http_header;
-    if(!quick->host[0]){senderrorresponsetoclient(client, BAD_REQUEST); return;}
-    if(!(quick->requesttype == 1 || quick->requesttype == 3)){senderrorresponsetoclient(client, NOT_IMPLIMENTED); return;}
+    if(!quick->host[0]){printf("\nhost empty");senderrorresponsetoclient(client, BAD_REQUEST);}
+    if(!(quick->requesttype == 1 || quick->requesttype == 3)){printf("\nrequest was POST or HEAD");senderrorresponsetoclient(client, NOT_IMPLIMENTED); return;}
     FILE * manifest = fopen("manifest.txt", "r");
     char path[MAX_PATH];
+    printf("\nsearching for path: \"%s\"", quick->path);
     while(EOF != fscanf_s(manifest, "%[^\r\n] ", path, sizeof(path))){
-        if(StrStrIA(quick->path, path)) goto found;
+        if(StrStrIA(path, quick->path)) goto found;
     }
-    senderrorresponsetoclient(client, NOT_FOUND);
+    printf("\nrequested resource was not found in manifest");
     fclose(manifest);
+    senderrorresponsetoclient(client, NOT_FOUND);
     return;
     found:
     fclose(manifest);
-    memcpy(path, "path.txt", 9); //DEBUG TEST MUST DELETE
-    FILE * file = fopen(path, "rb");
-    if(!file) senderrorresponsetoclient(client, NOT_FOUND);
+    printf("\nattempting to send \"%s\"", path);
+    FILE * file = fopen(path+1, "rb");
+    if(!file){printf("\nfile could not be opened"); senderrorresponsetoclient(client, NOT_FOUND);}
     #define MAX_REPLY_SIZE 100000 //MUST BE LARGER THAN 1Kb
     char response[MAX_REPLY_SIZE];
     fseek(file, 0, SEEK_END);
-    size_t contentlength = ftell(file) + 1;
+    size_t contentlength = ftell(file);
     rewind(file);
 
     snprintfappendinit(response, sizeof(response));
@@ -739,11 +743,13 @@ void reply(struct client_list_t* client){
         snprintfappend("Date: %s\r\n", datestr);
     snprintfappend("\r\n");
     if(quick->requesttype == 1){
-        if(snprintfgetbufremain() < contentlength){senderrorresponsetoclient(client, 0); return;}else{
-            if(contentlength!=fread(&response[MAX_REPLY_SIZE-snprintfgetbufremain()], 1, contentlength, file)) printf("\n\nwhatwhatwhat\n\n");
+        if(snprintfgetbufremain() < contentlength){printf("\ninternal buffer was not large enough to load file for response");senderrorresponsetoclient(client, 0);}else{
+            int ohno;
+            if(contentlength!=(ohno=fread(&response[MAX_REPLY_SIZE-snprintfgetbufremain()], 1, contentlength, file))) printf("\n\nwhatwhatwhat contentlength:%d fread:%d\n\n", contentlength, ohno);
             snprintftrackexternalwrite(contentlength);
         }
     }
+    printf("\nsent response:%.*s\n", MAX_REPLY_SIZE-snprintfgetbufremain(), response);
     send(client->sock, response, MAX_REPLY_SIZE-snprintfgetbufremain(), 0);
     fclose(file);
     if(!quick->connection){

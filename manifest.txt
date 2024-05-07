@@ -1,1 +1,1 @@
-land.txt
+/land.html

@@ -1,46 +1,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#include <shlwapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 int main() {
-    char field[] = "connec";
-    int fieldlen = strlen(field);
-    FILE * file = fopen("output.txt", "r");
-    fseek(file, 0, SEEK_END);
-    int buflen = ftell(file);
-    const char * returnstr;
-    char filestr[80000];
-    char * str = filestr;
-    fseek(file, 0, SEEK_SET);
-    fread(str, 1, buflen, file);
-    char * strend = str + buflen;
-    printf("%.*s", buflen, filestr);
-    returnstr = StrStrIA(str, field);
-    str = returnstr + strlen(field);
-    /*
-    {
-        char * tempstrend = strend - (fieldlen+1);
-        while(str < tempstrend){
-            int a;
-            putchar('\n');
-            for(a = 0; a < fieldlen; a++){
-                if(tolower(str[a]) != field[a]) {
-                    printf(" %c != %c",str[a], field[a]);
-                    str+= a > 0 ? a : 1;
-                    goto continuewhile;
-                }
-                printf("%c",str[a]);
-            }
-            returnstr = str;
-            str += a;
-            break;
-            continuewhile:
-        }
-        if(str == tempstrend){
-            printf("\nNot Found");
-            return 0;
-        }
-    }*/
-    printf("\n\nFound %s\n\n%.40s\n\n%.40s", field, (returnstr - 10 < filestr) ? filestr : returnstr - 10, str);
+    WSADATA data;
+    WSAStartup(MAKEWORD(2,2), &data);
+    struct addrinfo hints, *addr;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_flags = AI_PASSIVE;
+    hints.ai_protocol = IPPROTO_TCP;
+    printf("%d", getaddrinfo(0, "80", &hints, &addr));
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 }
