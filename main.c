@@ -20,6 +20,14 @@
 
 #define EXIT(message) do { fprintf(stderr, message); exit(1); } while(0)
 
+#define peWSA(functionname) do{int error = WSAGetLastError();\
+char * msg;\
+FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM, 0, error, 0, (LPTSTR)&msg, 0, NULL);\
+printf(functionname "() error: %s", msg);\
+exit(1);}while(0);
+
+#define peSSL(name) do{fprintf(stderr, name "() failed.\n");ERR_print_errors_fp(stderr);exit(0);}while(0);
+
 void printwsadata(WSADATA *a){
     union {
         WORD version;
@@ -133,12 +141,10 @@ struct client_list_t;
 struct client_list_t{
     SOCKET sock;
     struct client_list_t *next;
-}*client_list, *client_list_start, *client_list_end, *lowest_open_client, *previous_client, *currentclient;
+}*client_list, *client_list_start, *lowest_open_client, *currentclient, **got_client_from, **client_list_end_next;
 unsigned int numberofcurrentclients;
 int clientindex; //clientindex is set by main() only
 jmp_buf buf;
-void deleteclientandsplicelist(struct client_list_t * clienttodelete);
-void reply(struct client_list_t* client);
 
 void printclientinformation(struct client_list_t * client){
     int cli = client-client_list;
@@ -184,6 +190,39 @@ void printclientinformation_sparse(struct client_list_t * client){
 }
 //every function must maintain lowest_open_client before they exit
 //and not modify any other client except the one addressed to them or lowest_open_client, otherwise the program will break
+void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary and set all to 0, fix lowest open address and lowest open client, do not call clearclient directly
+    printf("\n\n~~~Clearing cient"); printclientinformation(clienttoclear);
+    if(!clienttoclear->sock || !addresses[clientindex].ss_family || !requests[clientindex].buffersize) {
+        printf("\nclienttoclear index:%lld", (ptrdiff_t)(clienttoclear-client_list));
+        EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
+    }
+    if(clienttoclear < lowest_open_client){
+        printf("\nlowest_open_client %d ->", lowest_open_client-client_list);
+        lowest_open_client = clienttoclear;
+        printf("%d", lowest_open_client-client_list);
+    }//min 
+    closesocket(clienttoclear->sock);
+    free(requests[clientindex].request); //relieve request buffer
+    memset(&addresses[clientindex], 0, sizeof(addresses[clientindex]));
+    memset(&requests[clientindex], 0, sizeof(requests[clientindex]));
+    memset(clienttoclear, 0, sizeof(struct client_list_t));
+    if(requests[clientindex].http_header){
+        memset(requests[clientindex].http_header, 0, sizeof(struct http_header_data_t));
+    }
+    printf("\nnumberofcurrentclients: %d -> %d", numberofcurrentclients, numberofcurrentclients-1);
+    numberofcurrentclients--;
+    if(numberofcurrentclients < 0){EXIT("\nnumberofcurrentclients < 0? in clearclient");}
+}
+
+void deleteclientandsplicelist(struct client_list_t * clienttodelete, struct client_list_t ** _gotclientfrom){
+    *_gotclientfrom = clienttodelete->next;
+    if(!clienttodelete->next){
+        client_list_end_next = _gotclientfrom;
+    }
+    clearclient(clienttodelete);
+    longjmp(buf, 1);
+}
+
 enum errortype_t {TOO_LONG = 414, NOT_ENOUGH_MEMORY = 507, BAD_REQUEST = 400, NOT_FOUND = 404, NOT_IMPLIMENTED = 501, REQUEST_TIMEOUT = 408};
 void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errortype_t error){
     printf("\nSending error to client:");
@@ -235,7 +274,7 @@ void senderrorresponsetoclient(struct client_list_t * clienttoclose, enum errort
         printf("\n%s\n", response);
         send(clienttoclose->sock, response, strlen(response), 0);
     }else printf(" Unable to send message, connection was closed.");
-    deleteclientandsplicelist(clienttoclose);
+    deleteclientandsplicelist(clienttoclose, got_client_from);
 }
 
 void initializehttprequestbuffer(struct client_list_t *structtoinit){
@@ -255,6 +294,10 @@ void resetclienthttprequestbuffer(struct client_list_t *structtoreset){
     requests[clientindex].buffersize = DEFAULTREQUESTBUFFERSIZE;
     free(requests[clientindex].request);
     requests[clientindex].request_end = requests[clientindex].request = (char *)calloc(requests[clientindex].buffersize, 1);
+    if(!requests[clientindex].request) {
+        printf("\nWas unable to initilize http request buffer for client ");printclientinformation_sparse(structtoreset);
+        senderrorresponsetoclient(structtoreset, NOT_ENOUGH_MEMORY);
+    }
     requests[clientindex].request_end--;
     requests[clientindex].handlerindex = 0;
     requests[clientindex].body_start = 0;
@@ -266,7 +309,6 @@ void resetclienthttprequestbuffer(struct client_list_t *structtoreset){
     printf("---->\n");
     printclientinformation(structtoreset);
 }
-
 void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
     if((requests[clientindex].buffersize <<= 1) > 0b100000000000000000000) {
         printf("\nWas unable to increase http request buffer size for client "); printclientinformation_sparse(clienttodouble);
@@ -278,8 +320,6 @@ void doubleclientrequestbuffer(struct client_list_t *clienttodouble){
         senderrorresponsetoclient(clienttodouble, NOT_ENOUGH_MEMORY);
     printf("\ndoubled client request buffer to %lu", requests[clientindex].buffersize);
 }
-//expects client_list_start and client_list_end and lowest_open_client to all be equal to client_list[0]
-//to account for the case where lowest_open_client is equal to client_list_end because client_list_end and client_list_start are incorrect when we have 0 clients
 void waitforatleastoneclient(SOCKET _listensock){
     printf("\n\n~~~~~~~Waiting for any connection...");
     if(lowest_open_client != client_list) EXIT("\nlowest_open_client != client_list   This should never happen");
@@ -292,13 +332,17 @@ void waitforatleastoneclient(SOCKET _listensock){
     printf("\nnumberofcurrentclients: %d -> %d", numberofcurrentclients, numberofcurrentclients+1);
     numberofcurrentclients++;
     client_list_start = client_list;
-    client_list_end = client_list;
+    client_list_end_next = &(client_list_start->next);
 }
 //expects _listensock to be ready and non-blocking place a client at the end of the list
 void acceptclient(SOCKET _listensock){
-    printf("\n\n~~~~~~~~Accepting new client. Loading into slot %lld\nSlot %lld now points to %lld", (ptrdiff_t)(lowest_open_client-client_list),(ptrdiff_t)(client_list_end-client_list),(ptrdiff_t)(lowest_open_client-client_list));
-    client_list_end->next = lowest_open_client;
-    client_list_end = lowest_open_client;
+    printf("\n\n~~~~~~~~Accepting new client. Loading into slot %lld\nSlot %lld now points to %lld",
+    (ptrdiff_t)(lowest_open_client-client_list),
+    (ptrdiff_t)((struct client_list_t *)((char*)client_list_end_next-offsetof(struct client_list_t, next))-client_list),
+    (ptrdiff_t)(lowest_open_client-client_list));
+
+    *client_list_end_next = lowest_open_client;
+    client_list_end_next = &(lowest_open_client->next);
     int temp = sizeof(struct sockaddr_storage);
     lowest_open_client->sock = accept(_listensock, (struct sockaddr *)&addresses[clientindex], &temp);
     initializehttprequestbuffer(lowest_open_client);
@@ -309,30 +353,6 @@ void acceptclient(SOCKET _listensock){
     numberofcurrentclients++;
 }
 
-void clearclient(struct client_list_t *clienttoclear){ //free() what's necessary and set all to 0, fix lowest open address and lowest open client, do not call clearclient directly
-    printf("\n\n~~~Clearing cient"); printclientinformation(clienttoclear);
-    if(!clienttoclear->sock || !addresses[clientindex].ss_family || !requests[clientindex].buffersize) {
-        printf("\nclienttoclear index:%lld", (ptrdiff_t)(clienttoclear-client_list));
-        EXIT("\nclearclient() found bad formatting, this is gonna be hard to debug");
-    }
-    if(clienttoclear < lowest_open_client){
-        printf("\nlowest_open_client %d ->", lowest_open_client-client_list);
-        lowest_open_client = clienttoclear;
-        printf("%d", lowest_open_client-client_list);
-    }//min 
-    closesocket(clienttoclear->sock);
-    free(requests[clientindex].request); //relieve request buffer
-    memset(&addresses[clientindex], 0, sizeof(addresses[clientindex]));
-    memset(&requests[clientindex], 0, sizeof(requests[clientindex]));
-    memset(clienttoclear, 0, sizeof(struct client_list_t));
-    if(requests[clientindex].http_header){
-        memset(requests[clientindex].http_header, 0, sizeof(struct http_header_data_t));
-    }
-    printf("\nnumberofcurrentclients: %d -> %d", numberofcurrentclients, numberofcurrentclients-1);
-    numberofcurrentclients--;
-    if(numberofcurrentclients < 0){EXIT("\nnumberofcurrentclients < 0? in clearclient");}
-}
-
 void replaceoldestclient(SOCKET _listensock){ //only called when client list is full
     //set the start pointer to next client
     //clear and free the old client
@@ -340,17 +360,6 @@ void replaceoldestclient(SOCKET _listensock){ //only called when client list is 
     client_list_start = client_list_start->next;
     clearclient(client_list_start_temp);
     acceptclient(_listensock);
-}
-
-void deleteclientandsplicelist(struct client_list_t * clienttodelete){
-    previous_client->next = clienttodelete->next;
-    if(clienttodelete == client_list_end){
-        client_list_end = previous_client;
-    }else if(clienttodelete == client_list_start){
-        client_list_start = clienttodelete->next;
-    }
-    clearclient(clienttodelete);
-    longjmp(buf, 1);
 }
 
 enum fieldtype_t {CONTENT_LENGTH, HOST, TRANSFER_ENCODING, CONNECTION, USER_AGENT, ACCEPT_LANGUAGE, ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, CACHE_CONTROL, DATE_FIELD, ETAG, EXPIRES, LAST_MODIFIED, SERVER, X_CACHE};
@@ -447,127 +456,6 @@ const char * extractfieldfromstring(const char str[], char* const strend, void *
         default: break;
     }
     return returnstr;
-}
-
-void choosehandler(struct client_list_t* client){
-    {
-        char tempchar = requests[clientindex].request[4];
-        requests[clientindex].request[4] = 0;
-        char * gettrue = (char *)((long long)StrStrA(requests[clientindex].request, "GET") | (long long)StrStrA(requests[clientindex].request, "HEAD"));
-        if(gettrue){
-            printf("\nprocessing a %s request", gettrue);
-            requests[clientindex].request[4] = tempchar;
-            reply(client);
-            return;
-        }else if(!StrStrA(requests[clientindex].request, "POST")){
-            senderrorresponsetoclient(client, BAD_REQUEST);
-        }
-        printf("\nprocessing a POST request");
-        requests[clientindex].request[4] = tempchar;
-    }
-    int length = 0;
-    const char * fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, &length, CONTENT_LENGTH);
-    if(fieldstart){
-        if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
-            printf("\nContent-Length: found but not properly formatted");
-            senderrorresponsetoclient(client, BAD_REQUEST);
-            return;
-        }else{
-            requests[clientindex].content_length = length;
-            requests[clientindex].handlerindex = FN_GETBODYCONTENTLENGTH;
-            return;
-        }
-    }
-    char * transferencoding;
-    fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, transferencoding, TRANSFER_ENCODING);
-    if(fieldstart){
-        if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
-            printf("\nTransfer-Encoding: found but not properly formatted");
-            senderrorresponsetoclient(client, BAD_REQUEST);
-            return;
-        }else{
-            if(requests[clientindex].request_end<transferencoding+strlen("chunked")-1 || strncmp("chunked", transferencoding, strlen("chunked"))){
-                senderrorresponsetoclient(client, NOT_IMPLIMENTED);
-                return;
-            }
-            requests[clientindex].handlerindex = FN_GETBODYCHUNKED;
-            return;
-        }
-    }
-    requests[clientindex].timeout+=10000+ACCEPTABLE_REPLY_LOAD; //10 seconds to recieve reply
-    requests[clientindex].handlerindex = FN_GRACIOUSREPLY;
-    unsigned long param = 1;
-    if (ioctlsocket(client->sock, FIONBIO, &param)) {
-        printf("\nFailed to set socket to non-blocking mode.");
-        deleteclientandsplicelist(client);
-    }
-}
-
-void getheader(struct client_list_t* client, int newbytes){//find when the header is complete
-    if(!newbytes){
-        printf("\nRecieved zero bytes");
-        senderrorresponsetoclient(client, BAD_REQUEST);
-        return;
-    }
-    char * startscan = requests[clientindex].request_end - newbytes - 3;//go back to not split "\r\n\r\n" in half
-    if(startscan-requests[clientindex].request < 0) startscan = requests[clientindex].request; //don't overflow
-    char * bodystart = strstr(startscan, "\r\n\r\n");
-    if(!bodystart) return;
-    requests[clientindex].body_start = bodystart+4;
-    choosehandler(client);
-}
-
-void getbodycontentlength(struct client_list_t* client, int newbytes){
-    if(!newbytes){
-        printf("\nRecieved zero bytes");
-        senderrorresponsetoclient(client, BAD_REQUEST);
-        return;
-    }
-    if(requests[clientindex].request_end - (requests[clientindex].body_start-1) < requests[clientindex].content_length){
-        return;
-    }
-    reply(client);
-}
-
-void getbodychunked(struct client_list_t* client, int newbytes){
-    static int bodyindex[MAXCLIENTS] = {0}; //points to the place where the next chunked length should be as added to body_start
-    if(!newbytes){
-        printf("\nRecieved zero bytes");
-        bodyindex[clientindex] = 0;
-        senderrorresponsetoclient(client, BAD_REQUEST);
-        return;
-    }
-    int bytelength;//length specified in the chunk processes in the while loop
-    while(requests[clientindex].body_start + bodyindex[clientindex] <= requests[clientindex].request_end){ //while where the next chunk length in hex should be is within the bounds of the request recieved so far which is maintained by main
-        char * chunklengthlinestart = requests[clientindex].body_start + bodyindex[clientindex];
-        int chunklengthlinelength;
-        char * checkfornewline = strstr(chunklengthlinestart, "\r\n");//request is always null terminated, we could rewrite this function to just use sscanf directly at the location and not check the while loop
-        if(!checkfornewline){printf("\nLine that should contain hexidecimal representation of next chunk was not terminated by CRLF, assuming the request is incomplete."); return;}
-        chunklengthlinelength = checkfornewline-chunklengthlinestart;
-        chunklengthlinelength+=2;
-        {
-            char tempbyte = chunklengthlinestart[chunklengthlinelength];
-            chunklengthlinestart[chunklengthlinelength] = 0;
-            if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], "%x", &bytelength)){printf("\nsscanf() did not find valid hexidecimal number."); senderrorresponsetoclient(client, BAD_REQUEST); return;}
-            chunklengthlinestart[chunklengthlinelength] = tempbyte;
-        }
-        if(!bytelength){
-            //cut off the last line which contains "0\r\n"
-            requests[clientindex].request_end = requests[clientindex].body_start + (bodyindex[clientindex] - 1);
-            *(requests[clientindex].request_end-1) = 0;
-            bodyindex[clientindex] = 0;
-            reply(client);
-        }
-        bytelength+=2;
-        //THIS CODE SHOULD BE TESTED ---->
-        memmove(chunklengthlinestart, chunklengthlinestart + chunklengthlinelength, bytelength);
-        requests[clientindex].request_end -= chunklengthlinelength;
-        bodyindex[clientindex] += bytelength;
-    }
-}
-
-void graciousreply(struct client_list_t* client, int newbytes){ //for POST requests, if not transfer-encoding chunked and if content-length is missing, process the request anyway after some time.
-    if(requests[clientindex].timeout-ACCEPTABLE_REPLY_LOAD < GetTickCount64()) reply(client);
 }
 
 void loadheaderdata(struct client_list_t * client){
@@ -749,10 +637,131 @@ void reply(struct client_list_t* client){
     send(client->sock, response, MAX_REPLY_SIZE-snprintfgetbufremain(), 0);
     fclose(file);
     if(!quick->connection){
-        deleteclientandsplicelist(client);
+        deleteclientandsplicelist(client, got_client_from);
     }else{
         resetclienthttprequestbuffer(client);
     }
+}
+
+void choosehandler(struct client_list_t* client){
+    {
+        char tempchar = requests[clientindex].request[4];
+        requests[clientindex].request[4] = 0;
+        char * gettrue = (char *)((long long)StrStrA(requests[clientindex].request, "GET") | (long long)StrStrA(requests[clientindex].request, "HEAD"));
+        if(gettrue){
+            printf("\nprocessing a %s request", gettrue);
+            requests[clientindex].request[4] = tempchar;
+            reply(client);
+            return;
+        }else if(!StrStrA(requests[clientindex].request, "POST")){
+            senderrorresponsetoclient(client, BAD_REQUEST);
+        }
+        printf("\nprocessing a POST request");
+        requests[clientindex].request[4] = tempchar;
+    }
+    int length = 0;
+    const char * fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, &length, CONTENT_LENGTH);
+    if(fieldstart){
+        if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
+            printf("\nContent-Length: found but not properly formatted");
+            senderrorresponsetoclient(client, BAD_REQUEST);
+            return;
+        }else{
+            requests[clientindex].content_length = length;
+            requests[clientindex].handlerindex = FN_GETBODYCONTENTLENGTH;
+            return;
+        }
+    }
+    char * transferencoding;
+    fieldstart = extractfieldfromstring(requests[clientindex].request, requests[clientindex].body_start, transferencoding, TRANSFER_ENCODING);
+    if(fieldstart){
+        if(fieldstart == HEADER_FIELD_FORMAT_ERROR){
+            printf("\nTransfer-Encoding: found but not properly formatted");
+            senderrorresponsetoclient(client, BAD_REQUEST);
+            return;
+        }else{
+            if(requests[clientindex].request_end<transferencoding+strlen("chunked")-1 || strncmp("chunked", transferencoding, strlen("chunked"))){
+                senderrorresponsetoclient(client, NOT_IMPLIMENTED);
+                return;
+            }
+            requests[clientindex].handlerindex = FN_GETBODYCHUNKED;
+            return;
+        }
+    }
+    requests[clientindex].timeout+=10000+ACCEPTABLE_REPLY_LOAD; //10 seconds to recieve reply
+    requests[clientindex].handlerindex = FN_GRACIOUSREPLY;
+    unsigned long param = 1;
+    if (ioctlsocket(client->sock, FIONBIO, &param)) {
+        printf("\nFailed to set socket to non-blocking mode.");
+        deleteclientandsplicelist(client, got_client_from);
+    }
+}
+
+void getheader(struct client_list_t* client, int newbytes){//find when the header is complete
+    if(!newbytes){
+        printf("\nRecieved zero bytes");
+        senderrorresponsetoclient(client, BAD_REQUEST);
+        return;
+    }
+    char * startscan = requests[clientindex].request_end - newbytes - 3;//go back to not split "\r\n\r\n" in half
+    if(startscan-requests[clientindex].request < 0) startscan = requests[clientindex].request; //don't overflow
+    char * bodystart = strstr(startscan, "\r\n\r\n");
+    if(!bodystart) return;
+    requests[clientindex].body_start = bodystart+4;
+    choosehandler(client);
+}
+
+void getbodycontentlength(struct client_list_t* client, int newbytes){
+    if(!newbytes){
+        printf("\nRecieved zero bytes");
+        senderrorresponsetoclient(client, BAD_REQUEST);
+        return;
+    }
+    if(requests[clientindex].request_end - (requests[clientindex].body_start-1) < requests[clientindex].content_length){
+        return;
+    }
+    reply(client);
+}
+
+void getbodychunked(struct client_list_t* client, int newbytes){
+    static int bodyindex[MAXCLIENTS] = {0}; //points to the place where the next chunked length should be as added to body_start
+    if(!newbytes){
+        printf("\nRecieved zero bytes");
+        bodyindex[clientindex] = 0;
+        senderrorresponsetoclient(client, BAD_REQUEST);
+        return;
+    }
+    int bytelength;//length specified in the chunk processes in the while loop
+    while(requests[clientindex].body_start + bodyindex[clientindex] <= requests[clientindex].request_end){ //while where the next chunk length in hex should be is within the bounds of the request recieved so far which is maintained by main
+        char * chunklengthlinestart = requests[clientindex].body_start + bodyindex[clientindex];
+        int chunklengthlinelength;
+        char * checkfornewline = strstr(chunklengthlinestart, "\r\n");//request is always null terminated, we could rewrite this function to just use sscanf directly at the location and not check the while loop
+        if(!checkfornewline){printf("\nLine that should contain hexidecimal representation of next chunk was not terminated by CRLF, assuming the request is incomplete."); return;}
+        chunklengthlinelength = checkfornewline-chunklengthlinestart;
+        chunklengthlinelength+=2;
+        {
+            char tempbyte = chunklengthlinestart[chunklengthlinelength];
+            chunklengthlinestart[chunklengthlinelength] = 0;
+            if(!sscanf(requests[clientindex].body_start + bodyindex[clientindex], "%x", &bytelength)){printf("\nsscanf() did not find valid hexidecimal number."); senderrorresponsetoclient(client, BAD_REQUEST); return;}
+            chunklengthlinestart[chunklengthlinelength] = tempbyte;
+        }
+        if(!bytelength){
+            //cut off the last line which contains "0\r\n"
+            requests[clientindex].request_end = requests[clientindex].body_start + (bodyindex[clientindex] - 1);
+            *(requests[clientindex].request_end-1) = 0;
+            bodyindex[clientindex] = 0;
+            reply(client);
+        }
+        bytelength+=2;
+        //THIS CODE SHOULD BE TESTED ---->
+        memmove(chunklengthlinestart, chunklengthlinestart + chunklengthlinelength, bytelength);
+        requests[clientindex].request_end -= chunklengthlinelength;
+        bodyindex[clientindex] += bytelength;
+    }
+}
+
+void graciousreply(struct client_list_t* client, int newbytes){ //for POST requests, if not transfer-encoding chunked and if content-length is missing, process the request anyway after some time.
+    if(requests[clientindex].timeout-ACCEPTABLE_REPLY_LOAD < GetTickCount64()) reply(client);
 }
 
 int main(){
@@ -772,7 +781,8 @@ int main(){
     requests = (struct http_request_t *)calloc(MAXCLIENTS, sizeof(struct http_request_t *));
     FD_ZERO(&listener_set_main);
     FD_SET(listensock, &listener_set_main);
-    lowest_open_client = client_list_start = client_list_end = client_list;
+    lowest_open_client = client_list_start = client_list;
+    client_list_end_next = &client_list;
     // when remove a client check to see if it's lower than lowest_open_client, if it is client_list_start make sure to maintain client_list_start by moving it to the next one
     // 
     // when add a client, move up to next empty space, == maxclients means full.
@@ -804,34 +814,35 @@ int main(){
                 }
             }
         }
-        previous_client = currentclient = client_list_start; //if currentclient == previous_client we know not to link back or else we create an infinite loop
-        do{ //must maintain previous_client
+        currentclient = client_list_start; //if currentclient == *got_client_from we know not to link back or else we create an infinite loop
+        got_client_from = &client_list_start;
+        do{ //must maintain got_client_from
             //printf("\nassessing clients", currentclient-client_list);
             if(setjmp(buf)) {
-                currentclient=previous_client;
+                currentclient = *got_client_from;
                 goto error;
             }
             clientindex = currentclient-client_list;
             {int64_t ticktemp = GetTickCount64();
             if(requests[clientindex].timeout < GetTickCount64()){
                 printf("\nClient timed out");
-                deleteclientandsplicelist(currentclient);
+                deleteclientandsplicelist(currentclient, got_client_from);
             }}
             FD_ZERO(&monoclient_set);
             FD_SET(currentclient->sock, &monoclient_set);
             struct timeval timeout = {0, 0};
             select(0, &monoclient_set, 0, 0, &timeout);
             if(FD_ISSET(currentclient->sock, &monoclient_set)){
-                int bufferremaining = requests[clientindex].buffersize - (requests[clientindex].request_end - requests[clientindex].request) - 1;
+                int bufferremaining = requests[clientindex].buffersize-(requests[clientindex].request_end - requests[clientindex].request + 1);
                 if(bufferremaining == 0) doubleclientrequestbuffer(currentclient);
-                int newbytes = recv(currentclient->sock, requests[clientindex].request, bufferremaining, 0);
-                if(newbytes == SOCKET_ERROR) EXIT("recv() in main failed for some reason.");
+                int newbytes = recv(currentclient->sock, requests[clientindex].request_end+1, bufferremaining, 0);
+                if(newbytes == SOCKET_ERROR) peWSA("recv");
                 requests[clientindex].request_end += newbytes;
                 (*(handlers+requests[clientindex].handlerindex))(currentclient, newbytes);
             }
-            previous_client = currentclient;
-            error:
+            got_client_from = &(currentclient->next);
             currentclient = currentclient->next;
+            error:
         }while(currentclient);//this is fine cause if we have 0 clients we just wait for accept();
     }
 }
