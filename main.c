@@ -63,7 +63,7 @@ void print_escaped_string(const char *str, size_t length) {
     }
 }
 
-void printaddressofsocket(SOCKET b){
+void printhostofsocket(SOCKET b){
     SOCKADDR_STORAGE a;
     size_t balls = sizeof(a);
     memset(&a, 0, sizeof(a));
@@ -71,6 +71,19 @@ void printaddressofsocket(SOCKET b){
     char hostname[NI_MAXHOST];
     char port[NI_MAXSERV];
     if(getnameinfo((struct sockaddr *)&a, sizeof(a), hostname, sizeof(hostname), port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV)) EXIT("\ngetnameinfo in printaddress");
+    hostname[NI_MAXHOST-1] = 0;
+    port[NI_MAXSERV-1] = 0;
+    printf("%s:%s", hostname, port);
+}
+
+void printpeerofsocket(SOCKET b) {
+    SOCKADDR_STORAGE a;
+    socklen_t addr_len = sizeof(a);
+    memset(&a, 0, sizeof(a));
+    if(getpeername(b, (struct sockaddr *)&a, &addr_len)) return;
+    char hostname[NI_MAXHOST];
+    char port[NI_MAXSERV];
+    if(getnameinfo((struct sockaddr *)&a, sizeof(a), hostname, sizeof(hostname), port, sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV)) EXIT("getnameinfo in printhostofsocket");
     hostname[NI_MAXHOST-1] = 0;
     port[NI_MAXSERV-1] = 0;
     printf("%s:%s", hostname, port);
@@ -148,7 +161,10 @@ jmp_buf buf;
 
 void printclientinformation(struct client_list_t * client){
     int cli = client-client_list;
-    printf("\nClient %lld -> %lld sock=%d ", client-client_list, ((client->next-client_list) >= 0) ? (client->next-client_list) : -1, client->sock);printaddressofsocket(client->sock);
+    printf("\nClient %lld -> %lld sock=%d ", client-client_list, ((client->next-client_list) >= 0) ? (client->next-client_list) : -1, client->sock);
+    printpeerofsocket(client->sock);
+    printf(" <-> ");
+    printhostofsocket(client->sock);
     printf( "\ncontent_length: \t%d"
             "\nhandler function index:\t%d"
             "\nbuffersize:\t\t%ld"
@@ -185,7 +201,10 @@ void printclientinformation(struct client_list_t * client){
 }
 void printclientinformation_sparse(struct client_list_t * client){
     int cli = client-client_list;
-    printf("Client %lld -> %lld sock=%d ", client-client_list, ((client->next-client_list) >= 0) ? (client->next-client_list) : -1, client->sock);printaddressofsocket(client->sock);
+    printf("Client %lld -> %lld sock=%d ", client-client_list, ((client->next-client_list) >= 0) ? (client->next-client_list) : -1, client->sock);
+    printpeerofsocket(client->sock);
+    printf(" <-> ");
+    printhostofsocket(client->sock);
     printf( "  timeout:\t\t%.3llf seconds", (((double)requests[cli].timeout-(double)GetTickCount64()))/(double)1000);
 }
 //every function must maintain lowest_open_client before they exit
@@ -325,7 +344,7 @@ void waitforatleastoneclient(SOCKET _listensock){
     if(lowest_open_client != client_list) EXIT("\nlowest_open_client != client_list   This should never happen");
     int temp = sizeof(struct sockaddr_storage);
     lowest_open_client->sock = accept(_listensock, (struct sockaddr *)&addresses[clientindex], &temp);
-    printf(" connection found on socket:%d ", client_list->sock);printaddressofsocket(client_list->sock);
+    printf(" connection found on socket:%d ", client_list->sock);printhostofsocket(client_list->sock);
     initializehttprequestbuffer(lowest_open_client);
     lowest_open_client++;
     printf("\nlowest_open_client %d -> %d", (lowest_open_client-client_list)-1, lowest_open_client-client_list);
@@ -775,7 +794,7 @@ int main(){
     printwsadata(&startup);
     SOCKET listensock = create_socket(0, "80");
     printf("\nListening on: ");
-    printaddressofsocket(listensock);
+    printhostofsocket(listensock);
     client_list = (struct client_list_t *)calloc(MAXCLIENTS+1, sizeof(struct client_list_t)); //set socket to 0 to clear, last is always 0 so that when we search for open spot we stop there
     addresses = (struct sockaddr_storage *)calloc(MAXCLIENTS, sizeof(struct sockaddr_storage));
     requests = (struct http_request_t *)calloc(MAXCLIENTS, sizeof(struct http_request_t *));
